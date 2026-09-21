@@ -1,0 +1,39 @@
+season_rules:
+  squad_size: 15
+  goalkeepers: 2
+  defenders: 5
+  midfielders: 5
+  forwards: 3
+  max_players_per_club: 3
+  transfer_hit_cost: 4.0
+  max_free_transfers: 5
+  initial_free_transfers: 1
+  starting_xi_size: 11
+  min_defenders: 3
+  min_midfielders: 2
+  min_forwards: 1
+  min_goalkeepers: 1
+  max_goalkeepers: 1
+
+scoring_rules:
+  appearance_less_than_60: 1
+  appearance_60_or_more: 2
+  goals:
+    GKP: 6
+    DEF: 6
+    MID: 5
+    FWD: 4
+  assists: 3
+  clean_sheets:
+    GKP: 4
+    DEF: 4
+    MID: 1
+    FWD: 0
+  saves_per_point: 3
+  penalty_saves: 5
+  penalty_misses: -2
+  yellow_cards: -1
+  red_cards: -3
+  own_goals: -2
+  goals_conceded_deduction_threshold: 2
+  goals_conceded_deduction: -1

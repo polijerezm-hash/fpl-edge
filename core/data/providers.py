@@ -1,5 +1,6 @@
 import time
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional
@@ -43,6 +44,18 @@ class DataProvider(ABC):
     def get_status(self) -> DataStatus:
         pass
 
+    def get_manager_leagues(self, manager_id: int) -> List[Dict[str, Any]]:
+        return []
+
+    def get_mini_league_analysis(
+        self,
+        manager_id: int,
+        league_id: int,
+        gameweek: int,
+        players: List[Player]
+    ) -> Dict[str, Any]:
+        raise LiveDataUnavailableError("Mini-league analysis is not available for this provider")
+
 
 class DemoProvider(DataProvider):
     data_mode: str = "demo"
@@ -75,6 +88,48 @@ class DemoProvider(DataProvider):
             last_updated=self._timestamp,
             details="Operational offline seed dataset for testing and evaluation."
         )
+
+    def get_manager_leagues(self, manager_id: int) -> List[Dict[str, Any]]:
+        return [
+            {"id": 9001, "name": "Sunday League Legends", "league_type": "x", "rank": 2, "last_rank": 3, "entries": 12},
+            {"id": 9002, "name": "Office Invitational", "league_type": "x", "rank": 5, "last_rank": 5, "entries": 28},
+            {"id": 9003, "name": "Family & Friends", "league_type": "x", "rank": 1, "last_rank": 1, "entries": 9},
+        ]
+
+    def get_mini_league_analysis(
+        self,
+        manager_id: int,
+        league_id: int,
+        gameweek: int,
+        players: List[Player]
+    ) -> Dict[str, Any]:
+        leagues = {league["id"]: league for league in self.get_manager_leagues(manager_id)}
+        league = leagues.get(league_id, next(iter(leagues.values())))
+        player_map = {p.player_id: p for p in players}
+        user_owned = {sp.player_id for sp in DEMO_MANAGER_SQUAD.squad}
+        demo_eo = {401: 142.0, 301: 98.0, 303: 85.0, 302: 72.0, 304: 25.0, 305: 18.0, 203: 44.0}
+        exposures = []
+        for pid, eo in demo_eo.items():
+            player = player_map.get(pid)
+            if player:
+                exposures.append({
+                    "player_id": pid,
+                    "web_name": player.web_name,
+                    "league_eo": eo,
+                    "you_own": pid in user_owned,
+                    "your_multiplier": 2 if pid == 301 else (1 if pid in user_owned else 0),
+                })
+        return {
+            "league": league,
+            "gameweek": gameweek,
+            "sample_size": league.get("entries", 12),
+            "standings": [
+                {"rank": 1, "entry": 81001, "entry_name": "Expected Toulouse", "player_name": "Alex Morgan", "total": 286, "event_total": 63},
+                {"rank": league.get("rank", 2), "entry": manager_id, "entry_name": DEMO_MANAGER_SQUAD.team_name, "player_name": DEMO_MANAGER_SQUAD.manager_name, "total": DEMO_MANAGER_SQUAD.overall_points, "event_total": 58},
+                {"rank": 3, "entry": 81003, "entry_name": "Moves Like Agger", "player_name": "Sam Taylor", "total": 253, "event_total": 51},
+            ],
+            "exposures": sorted(exposures, key=lambda row: row["league_eo"], reverse=True),
+        }
 
 
 class FplOfficialProvider(DataProvider):
@@ -181,6 +236,7 @@ class FplOfficialProvider(DataProvider):
                 position=pos_map.get(el.get("element_type", 3), Position.MID),
                 current_price=round(safe_float(el.get("now_cost", 50)) / 10.0, 1),
                 selected_by_pct=sel_pct,
+                can_select=bool(el.get("can_select", True)),
                 status=el.get("status", "a"),
                 chance_of_playing_next_round=el.get("chance_of_playing_next_round"),
                 news=el.get("news", "") or "",
@@ -198,9 +254,139 @@ class FplOfficialProvider(DataProvider):
                 expected_goals=safe_float(el.get("expected_goals")),
                 expected_assists=safe_float(el.get("expected_assists")),
                 expected_goal_involvements=safe_float(el.get("expected_goal_involvements")),
-                expected_goals_conceded=safe_float(el.get("expected_goals_conceded"))
+                expected_goals_conceded=safe_float(el.get("expected_goals_conceded")),
+                influence=safe_float(el.get("influence")),
+                creativity=safe_float(el.get("creativity")),
+                threat=safe_float(el.get("threat")),
+                ict_index=safe_float(el.get("ict_index"))
             ))
         return players
+
+    def _get_json(self, path: str) -> Dict[str, Any]:
+        try:
+            response = requests.get(
+                f"{self.BASE_URL}{path}",
+                headers=self._get_headers(),
+                timeout=self.timeout,
+            )
+            if response.status_code == 404:
+                raise InvalidTeamIdError(f"FPL resource was not found: {path}")
+            if response.status_code != 200:
+                raise LiveDataUnavailableError(
+                    f"Official FPL API returned HTTP {response.status_code}",
+                    details={"path": path, "status_code": response.status_code},
+                )
+            return response.json()
+        except requests.RequestException as exc:
+            raise LiveDataUnavailableError(
+                f"Failed to fetch official FPL data: {str(exc)}",
+                details={"path": path},
+            ) from exc
+
+    def get_manager_leagues(self, manager_id: int) -> List[Dict[str, Any]]:
+        entry = self._get_json(f"/entry/{manager_id}/")
+        classic = entry.get("leagues", {}).get("classic", [])
+        leagues = []
+        for league in classic:
+            if league.get("league_type") not in {"x", "s"}:
+                continue
+            leagues.append({
+                "id": int(league["id"]),
+                "name": league.get("name", f"League {league['id']}"),
+                "league_type": league.get("league_type", "x"),
+                "rank": league.get("entry_rank") or league.get("rank"),
+                "last_rank": league.get("entry_last_rank") or league.get("last_rank"),
+                "entries": league.get("max_entries") or 0,
+            })
+        return leagues
+
+    def get_mini_league_analysis(
+        self,
+        manager_id: int,
+        league_id: int,
+        gameweek: int,
+        players: List[Player]
+    ) -> Dict[str, Any]:
+        manager_leagues = {league["id"]: league for league in self.get_manager_leagues(manager_id)}
+        if league_id not in manager_leagues:
+            raise InvalidTeamIdError(f"League {league_id} is not available for manager {manager_id}")
+
+        standings_payload = self._get_json(
+            f"/leagues-classic/{league_id}/standings/?page_standings=1"
+        )
+        standings = standings_payload.get("standings", {}).get("results", [])[:30]
+        if not standings:
+            return {
+                "league": manager_leagues[league_id],
+                "gameweek": gameweek,
+                "sample_size": 0,
+                "standings": [],
+                "exposures": [],
+            }
+
+        def fetch_picks(entry_id: int) -> tuple[int, List[Dict[str, Any]]]:
+            try:
+                payload = self._get_json(f"/entry/{entry_id}/event/{gameweek}/picks/")
+                return entry_id, payload.get("picks", [])
+            except (LiveDataUnavailableError, InvalidTeamIdError):
+                return entry_id, []
+
+        picks_by_entry: Dict[int, List[Dict[str, Any]]] = {}
+        entry_ids = [int(row["entry"]) for row in standings]
+        if manager_id not in entry_ids:
+            entry_ids.append(manager_id)
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = [pool.submit(fetch_picks, entry_id) for entry_id in entry_ids]
+            for future in as_completed(futures):
+                entry_id, picks = future.result()
+                if picks:
+                    picks_by_entry[entry_id] = picks
+
+        sample_size = len(picks_by_entry)
+        if sample_size == 0:
+            return {
+                "league": manager_leagues[league_id],
+                "gameweek": gameweek,
+                "sample_size": 0,
+                "standings": standings,
+                "exposures": [],
+            }
+
+        ownership_counts: Dict[int, int] = {}
+        multiplier_totals: Dict[int, int] = {}
+        for picks in picks_by_entry.values():
+            for pick in picks:
+                pid = int(pick["element"])
+                ownership_counts[pid] = ownership_counts.get(pid, 0) + 1
+                multiplier_totals[pid] = multiplier_totals.get(pid, 0) + int(pick.get("multiplier", 0))
+
+        user_picks = {
+            int(pick["element"]): int(pick.get("multiplier", 0))
+            for pick in picks_by_entry.get(manager_id, [])
+        }
+        player_map = {p.player_id: p for p in players}
+        exposures = []
+        for pid, count in ownership_counts.items():
+            player = player_map.get(pid)
+            if not player:
+                continue
+            exposures.append({
+                "player_id": pid,
+                "web_name": player.web_name,
+                "league_ownership": round(100.0 * count / sample_size, 1),
+                "league_eo": round(100.0 * multiplier_totals.get(pid, 0) / sample_size, 1),
+                "you_own": pid in user_picks,
+                "your_multiplier": user_picks.get(pid, 0),
+            })
+
+        return {
+            "league": manager_leagues[league_id],
+            "gameweek": gameweek,
+            "sample_size": sample_size,
+            "standings": standings,
+            "exposures": sorted(exposures, key=lambda row: row["league_eo"], reverse=True),
+        }
 
     def get_teams(self) -> List[Team]:
         data = self._fetch_bootstrap()

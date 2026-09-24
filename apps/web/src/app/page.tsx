@@ -370,7 +370,7 @@ export default function HomePage() {
           )}
 
           {activeTab === "minileague" && (
-            <MiniLeagueView managerState={managerState} />
+            <MiniLeagueView managerState={managerState} dataMode={dm} />
           )}
 
           {activeTab === "accuracy" && (
@@ -399,6 +399,7 @@ export default function HomePage() {
         isOpen={isAssistantOpen}
         onClose={() => setIsAssistantOpen(false)}
         managerId={managerId}
+        dataMode={dm}
       />
     </div>
   );

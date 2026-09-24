@@ -18,6 +18,7 @@ class Player(BaseModel):
     position: Position
     current_price: float  # e.g. 12.5
     selected_by_pct: float
+    can_select: bool = True
     status: str = "a"  # 'a'=available, 'd'=doubtful, 'i'=injured, 's'=suspended, 'u'=unavailable
     chance_of_playing_next_round: Optional[int] = 100
     news: Optional[str] = ""
@@ -36,6 +37,10 @@ class Player(BaseModel):
     expected_assists: float = 0.0
     expected_goal_involvements: float = 0.0
     expected_goals_conceded: float = 0.0
+    influence: float = 0.0
+    creativity: float = 0.0
+    threat: float = 0.0
+    ict_index: float = 0.0
 
 class Team(BaseModel):
     team_id: int

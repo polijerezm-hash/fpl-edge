@@ -28,7 +28,7 @@ export const PlayerExplorer: React.FC<PlayerExplorerProps> = ({
     if (positionFilter !== "ALL" && p.position !== positionFilter) return false;
     if (p.current_price > maxPrice) return false;
     if (search) {
-      const q = search.lower();
+      const q = search.toLowerCase();
       return (
         p.web_name.toLowerCase().includes(q) ||
         p.first_name.toLowerCase().includes(q) ||

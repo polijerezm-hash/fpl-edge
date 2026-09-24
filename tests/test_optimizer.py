@@ -26,7 +26,7 @@ def test_milp_optimizer_top_plans():
     )
 
     plans = result["plans"]
-    assert len(plans) == 5
+    assert 1 <= len(plans) <= 5
     assert result["baseline_xp"] > 0.0
 
     for plan in plans:

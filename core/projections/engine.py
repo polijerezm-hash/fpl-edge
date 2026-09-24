@@ -1,5 +1,4 @@
 import math
-import numpy as np
 import yaml
 from typing import List, Dict, Any, Optional, Tuple
 from core.data.models import Player, Team, Fixture, Position, Projection
@@ -27,6 +26,30 @@ class ProjectionEngine:
                 }
             }
 
+    @staticmethod
+    def _shrunk_rate(total: float, minutes: int, prior_rate: float, prior_minutes: float = 720.0) -> float:
+        """Bayesian-style shrinkage keeps small samples from dominating forecasts."""
+        if minutes <= 0 or total <= 0:
+            return prior_rate
+        observed_rate = total / (minutes / 90.0)
+        evidence = minutes / (minutes + prior_minutes)
+        return evidence * observed_rate + (1.0 - evidence) * prior_rate
+
+    @staticmethod
+    def _risk_distribution(mean_xp: float, position: Position) -> Tuple[float, float, float]:
+        positional_noise = {
+            Position.GKP: 1.65,
+            Position.DEF: 2.05,
+            Position.MID: 2.35,
+            Position.FWD: 2.45,
+        }[position]
+        std_dev = max(positional_noise, mean_xp * 0.38 + 0.65)
+        return (
+            round(max(0.0, mean_xp - 1.28 * std_dev), 2),
+            round(max(0.0, mean_xp - 0.06 * std_dev), 2),
+            round(mean_xp + 1.28 * std_dev, 2),
+        )
+
     def calculate_projection(
         self,
         player: Player,
@@ -37,18 +60,27 @@ class ProjectionEngine:
         reconciled_mins: Optional[Dict[str, float]] = None,
         as_of_timestamp: str = "",
         snapshot_id: Optional[str] = None,
-        model_version: str = "1.0.0"
+        model_version: str = "2.0.0"
     ) -> Projection:
         scoring = self.rules.get("scoring_rules", {})
 
         # 1. Minutes & Start Probability
-        if reconciled_mins:
+        if not player.can_select or player.status in {"i", "s", "u"}:
+            xmins = 0.0
+            start_prob = 0.0
+            appearance_prob = 0.0
+        elif reconciled_mins:
             xmins = reconciled_mins.get("expected_minutes", 70.0)
             start_prob = reconciled_mins.get("start_probability", 0.8)
+            appearance_prob = reconciled_mins.get(
+                "appearance_probability",
+                min(1.0, start_prob + reconciled_mins.get("sub_probability", 0.0)),
+            )
         else:
             avail = self.availability_engine.estimate_player_availability(player, player_team, is_home)
             xmins = avail.expected_minutes
             start_prob = avail.chance_start
+            appearance_prob = avail.chance_appearance
 
         mins_fraction = min(1.0, max(0.0, xmins / 90.0))
 
@@ -82,49 +114,45 @@ class ProjectionEngine:
         def_str = player_team.strength_defence_home if is_home else player_team.strength_defence_away
         opp_att_str = opponent_team.strength_attack_away if is_home else opponent_team.strength_attack_home
 
-        expected_team_goals = max(0.4, 1.35 * att_str / max(0.6, opp_def_str))
-        expected_team_conceded = max(0.3, 1.25 * opp_att_str / max(0.6, def_str))
+        home_attack_factor = 1.08 if is_home else 0.94
+        expected_team_goals = min(3.2, max(0.35, 1.45 * att_str / max(0.65, opp_def_str) * home_attack_factor))
+        expected_team_conceded = min(3.2, max(0.25, 1.35 * opp_att_str / max(0.65, def_str) / home_attack_factor))
 
         # 3. Component Rates per 90 mins (incorporating real player stats where available)
         price_delta = max(0.0, player.current_price - 4.5)
         
-        # Calculate empirical xG per 90 / xA per 90 if player has played significant minutes
-        has_stats = player.minutes >= 180
-        empirical_xg_90 = (player.expected_goals / (player.minutes / 90.0)) if has_stats and player.expected_goals > 0 else None
-        empirical_xa_90 = (player.expected_assists / (player.minutes / 90.0)) if has_stats and player.expected_assists > 0 else None
-
+        fixture_attack_factor = min(1.65, max(0.55, expected_team_goals / 1.45))
         if player.position == Position.FWD:
-            baseline_goal_rate = (0.35 + 0.04 * price_delta) * (expected_team_goals / 1.35)
-            goal_rate_90 = (0.5 * empirical_xg_90 + 0.5 * baseline_goal_rate) if empirical_xg_90 is not None else baseline_goal_rate
-            
-            baseline_assist_rate = 0.14 + 0.02 * price_delta
-            assist_rate_90 = (0.5 * empirical_xa_90 + 0.5 * baseline_assist_rate) if empirical_xa_90 is not None else baseline_assist_rate
-            
+            prior_goal_rate = min(0.78, 0.30 + 0.035 * price_delta)
+            prior_assist_rate = min(0.34, 0.12 + 0.018 * price_delta)
             clean_sheet_prob = 0.0
             saves_90 = 0.0
-            bonus_factor = 0.60
+            bonus_factor = 0.58
         elif player.position == Position.MID:
-            baseline_goal_rate = (0.22 + 0.035 * price_delta) * (expected_team_goals / 1.35)
-            goal_rate_90 = (0.5 * empirical_xg_90 + 0.5 * baseline_goal_rate) if empirical_xg_90 is not None else baseline_goal_rate
-            
-            baseline_assist_rate = 0.18 + 0.025 * price_delta
-            assist_rate_90 = (0.5 * empirical_xa_90 + 0.5 * baseline_assist_rate) if empirical_xa_90 is not None else baseline_assist_rate
-            
+            prior_goal_rate = min(0.62, 0.16 + 0.028 * price_delta)
+            prior_assist_rate = min(0.44, 0.15 + 0.022 * price_delta)
             clean_sheet_prob = math.exp(-expected_team_conceded) * 0.85
             saves_90 = 0.0
-            bonus_factor = 0.55
+            bonus_factor = 0.52
         elif player.position == Position.DEF:
-            goal_rate_90 = 0.04 + 0.01 * price_delta
-            assist_rate_90 = 0.08 + 0.015 * price_delta
+            prior_goal_rate = min(0.18, 0.025 + 0.008 * price_delta)
+            prior_assist_rate = min(0.25, 0.055 + 0.012 * price_delta)
             clean_sheet_prob = math.exp(-expected_team_conceded)
             saves_90 = 0.0
-            bonus_factor = 0.40
+            bonus_factor = 0.38
         else: # GKP
-            goal_rate_90 = 0.0
-            assist_rate_90 = 0.005
+            prior_goal_rate = 0.0
+            prior_assist_rate = 0.003
             clean_sheet_prob = math.exp(-expected_team_conceded)
-            saves_90 = max(1.5, 2.5 * (expected_team_conceded / 1.2))
+            historical_saves_90 = self._shrunk_rate(float(player.saves), player.minutes, 2.8, 900.0)
+            saves_90 = max(1.2, historical_saves_90 * min(1.45, max(0.75, expected_team_conceded / 1.25)))
             bonus_factor = 0.30
+
+        goal_rate_90 = self._shrunk_rate(player.expected_goals, player.minutes, prior_goal_rate)
+        assist_rate_90 = self._shrunk_rate(player.expected_assists, player.minutes, prior_assist_rate)
+        # Apply fixture/team context without erasing longer-term player quality.
+        goal_rate_90 *= 0.65 + 0.35 * fixture_attack_factor
+        assist_rate_90 *= 0.72 + 0.28 * fixture_attack_factor
 
         # Scale by expected minutes
         expected_goals = goal_rate_90 * mins_fraction
@@ -132,8 +160,8 @@ class ProjectionEngine:
         expected_saves = saves_90 * mins_fraction
         
         # Appearance Points
-        p_60_plus = start_prob * min(1.0, max(0.0, (xmins - 15.0) / 75.0))
-        appearance_xp = p_60_plus * 2.0 + (1.0 - p_60_plus) * (1.0 if xmins > 5 else 0.0)
+        p_60_plus = min(start_prob, max(0.0, (xmins - 12.0) / 72.0))
+        appearance_xp = appearance_prob + p_60_plus
 
         # FPL Component Scoring
         goal_pts = scoring.get("goals", {}).get(player.position.value, 4)
@@ -151,27 +179,28 @@ class ProjectionEngine:
             conceded_xp_deduction = 0.0
 
         # Cards & Bonus xP
-        card_deduction = 0.12 * mins_fraction
-        bonus_xp = (expected_goals * 1.8 + expected_assists * 1.2 + (1.0 if clean_sheet_prob > 0.4 else 0.0) * 0.8) * bonus_factor
+        card_deduction = 0.10 * mins_fraction
+        historical_bonus_90 = self._shrunk_rate(float(player.bonus), player.minutes, 0.18, 900.0)
+        bonus_xp = (
+            expected_goals * 1.55
+            + expected_assists * 1.05
+            + p_60_plus * clean_sheet_prob * (0.55 if player.position in {Position.GKP, Position.DEF} else 0.15)
+            + historical_bonus_90 * mins_fraction * 0.25
+        ) * bonus_factor
 
         model_mean_xp = appearance_xp + goal_xp + assist_xp + cs_xp + save_xp + bonus_xp - conceded_xp_deduction - card_deduction
         model_mean_xp = round(max(0.0, model_mean_xp), 2)
 
-        # Blend with official FPL ep_next / form signal if available
+        # Official ep_next is useful as a weak ensemble member, not half the model.
         if player.ep_next > 0:
-            ep_next_mins = player.ep_next * mins_fraction
-            mean_xp = round(0.50 * model_mean_xp + 0.50 * ep_next_mins, 2)
+            mean_xp = round(0.82 * model_mean_xp + 0.18 * player.ep_next, 2)
         elif player.form > 0:
-            form_mult = min(1.25, max(0.75, player.form / 4.5))
-            mean_xp = round(model_mean_xp * form_mult, 2)
+            form_anchor = min(8.0, max(0.0, player.form))
+            mean_xp = round(0.92 * model_mean_xp + 0.08 * form_anchor, 2)
         else:
             mean_xp = model_mean_xp
 
-        # Monte Carlo Distribution Percentiles (P10, P50, P90)
-        std_dev = max(1.2, mean_xp * 0.45 + 0.8)
-        p10 = round(max(0.0, mean_xp - 1.28 * std_dev), 2)
-        p50 = round(max(0.0, mean_xp - 0.1 * std_dev), 2)
-        p90 = round(mean_xp + 1.28 * std_dev, 2)
+        p10, p50, p90 = self._risk_distribution(mean_xp, player.position)
 
         return Projection(
             player_id=player.player_id,
@@ -203,7 +232,7 @@ class ProjectionEngine:
         reconciled_mins: Optional[Dict[str, float]] = None,
         as_of_timestamp: str = "",
         snapshot_id: Optional[str] = None,
-        model_version: str = "1.0.0"
+        model_version: str = "2.0.0"
     ) -> Projection:
         """
         Calculates gameweek projection supporting Blank Gameweeks (0 fixtures),

@@ -10,7 +10,8 @@ class GroundedExplainerEngine:
     Uses LLM API if configured, otherwise falls back to deterministic template explanations.
     """
     def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY") or os.getenv("AZURE_OPENAI_KEY")
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        self.model = os.getenv("OPENAI_MODEL", "gpt-6-sol")
 
     def build_decision_context(
         self,
@@ -19,7 +20,8 @@ class GroundedExplainerEngine:
         alternative_plans: List[Dict[str, Any]],
         player_lookup: Dict[int, Dict[str, Any]],
         as_of_timestamp: str = "",
-        model_version: str = "1.0.0"
+        model_version: str = "2.0.0",
+        captaincy: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Creates the standardized, immutable DECISION_CONTEXT object.
@@ -32,6 +34,8 @@ class GroundedExplainerEngine:
             "recommendation": recommendation_plan,
             "alternatives": alternative_plans,
             "players": player_lookup,
+            "captaincy": captaincy or {},
+            "allowed_player_ids": sorted(int(pid) for pid in player_lookup.keys()),
             "constraints": {
                 "max_club": 3,
                 "hit_cost": 4,
@@ -72,6 +76,7 @@ class GroundedExplainerEngine:
         rec = ctx.get("recommendation", {})
         alts = ctx.get("alternatives", [])
         players = ctx.get("players", {})
+        captaincy = ctx.get("captaincy", {})
 
         gain = rec.get("gain_vs_hold", 0.0)
         final_bank = rec.get("final_bank", 0.0)
@@ -107,11 +112,20 @@ class GroundedExplainerEngine:
                 )
 
         if "captain" in q_lower:
+            captain_pick = captaincy.get("diamond") or {}
+            if not captain_pick:
+                return (
+                    "**Captaincy check failed safely**\n\n"
+                    "There is no eligible outfield captain with sufficient expected minutes and start probability in the current snapshot. "
+                    "Refresh the data or review the lineup before setting an armband."
+                )
+            cap_name = captain_pick.get("web_name", cap_name)
             return (
                 f"**Captaincy Explanation**\n\n"
-                f"**{cap_name}** is selected as captain for GW{gw1.get('gw', 5)}. "
-                f"The model selects {cap_name} because they offer the highest expected points product "
-                f"(expected minutes × component goal/assist probabilities) while maintaining high starting certainty."
+                f"**{cap_name}** is the balanced captain for GW{gw1.get('gw', 5)} at "
+                f"{captain_pick.get('mean_xp', 0)} xP, {captain_pick.get('xmins', 0)} expected minutes and a "
+                f"{round(captain_pick.get('start_prob', 0) * 100)}% start probability. "
+                f"Only eligible outfield starters are considered."
             )
 
         if "compare" in q_lower or "beat" in q_lower:
@@ -140,20 +154,29 @@ class GroundedExplainerEngine:
             "You are an analytical Fantasy Premier League assistant.\n"
             "Use ONLY information contained inside DECISION_CONTEXT.\n"
             "Never invent expected points, injuries, availability, prices, fixtures, probabilities, or optimizer outputs.\n"
-            "Explain recommendations produced by deterministic models clearly."
+            "Never recommend or mention a player who is absent from allowed_player_ids.\n"
+            "For captain questions, only use captaincy.ranked; goalkeepers and rejected candidates are forbidden.\n"
+            "If the context cannot answer safely, state that clearly. Explain recommendations produced by deterministic models clearly."
         )
         user_prompt = f"DECISION_CONTEXT:\n{json.dumps(ctx, indent=2)}\n\nUSER QUESTION: {question}"
 
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         payload = {
-            "model": "gpt-4o-mini",
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            "temperature": 0.2
+            "model": self.model,
+            "instructions": system_prompt,
+            "input": user_prompt,
+            "reasoning": {"effort": "medium"},
+            "text": {"verbosity": "low"},
         }
-        resp = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=8)
+        resp = requests.post("https://api.openai.com/v1/responses", headers=headers, json=payload, timeout=20)
         if resp.status_code == 200:
-            return resp.json()["choices"][0]["message"]["content"]
+            data = resp.json()
+            if data.get("output_text"):
+                return data["output_text"]
+            parts = []
+            for item in data.get("output", []):
+                for content in item.get("content", []):
+                    if content.get("type") == "output_text" and content.get("text"):
+                        parts.append(content["text"])
+            return "\n".join(parts) or None
         return None

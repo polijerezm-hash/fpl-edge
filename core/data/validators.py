@@ -180,6 +180,10 @@ class LiveDataValidator:
             for pid in tin:
                 if pid not in players_dict:
                     errors.append(f"GW{gw}: Transfer in player_id {pid} does not exist in active snapshot")
+                else:
+                    incoming = players_dict[pid]
+                    if not incoming.can_select or incoming.status in {"i", "s", "u"}:
+                        errors.append(f"GW{gw}: Transfer target {incoming.web_name} is not selectable/available")
 
             # 2. Outgoing transfers must exist in squad prior to transfer
             for pid in tout:
@@ -206,6 +210,10 @@ class LiveDataValidator:
                 errors.append(f"GW{gw}: Captain {captain} is not in starting XI")
             if vcaptain not in starters:
                 errors.append(f"GW{gw}: Vice-captain {vcaptain} is not in starting XI")
+            if captain in players_dict and players_dict[captain].position == Position.GKP:
+                errors.append(f"GW{gw}: Goalkeeper {players_dict[captain].web_name} cannot be recommended as captain")
+            if vcaptain in players_dict and players_dict[vcaptain].position == Position.GKP:
+                errors.append(f"GW{gw}: Goalkeeper {players_dict[vcaptain].web_name} cannot be recommended as vice-captain")
 
             # 6. Max 3 per club
             team_counts: Dict[int, int] = {}

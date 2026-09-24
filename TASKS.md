@@ -84,4 +84,15 @@
   - [x] Added Recommendation Provenance & Audit Trail section to UI
   - [x] Rewrote `Header.tsx` and `page.tsx` for end-to-end `data_mode` propagation and FT confirmation
   - [x] Expanded test suite to 21 passing unit tests (`tests/`)
-  - [x] Created `scripts/live_smoke_test.py` passing 100% with real FPL data
+- [x] Created `scripts/live_smoke_test.py` passing 100% with real FPL data
+
+- [x] **Phase 11: Recommendation Quality & Product Rework**
+  - [x] Rebuilt expected-minutes model with exclusive goalkeeper roles and club-level reconciliation
+  - [x] Added sample-size shrinkage and distribution-aware expected-points projections
+  - [x] Added hard captain and transfer eligibility gates for unavailable/non-playing players
+  - [x] Added saved-transfer value, minimum action edge, weighted bench value, and anti-churn constraints
+  - [x] Unified planner and explanation context so chat cannot independently re-plan
+  - [x] Corrected live decision target to the upcoming gameweek and dynamic season metadata
+  - [x] Added live mini-league listings, standings, effective ownership, differentials, and threats
+  - [x] Rebranded the interface with the FPL Edge mark and a restrained matchday-analysis visual system
+  - [x] Expanded the regression suite to 25 passing tests

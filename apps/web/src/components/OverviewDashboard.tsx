@@ -90,7 +90,7 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
         {/* Card 3: Free Transfers State */}
         <div className="bg-surface border border-surfaceBorder rounded-2xl p-5 relative overflow-hidden group hover:border-primary/50 transition-all">
           <div className="text-xs font-semibold text-slate-400 uppercase tracking-wider">Free Transfers</div>
-          <div className="text-3xl font-extrabold text-cyan-400 font-mono mt-2 flex items-baseline gap-2">
+          <div className="text-3xl font-extrabold text-secondary font-mono mt-2 flex items-baseline gap-2">
             <span>{managerState?.free_transfers ?? 1}</span>
             <span className="text-xs text-slate-400 font-normal">/ 5 max</span>
           </div>
@@ -113,7 +113,7 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
       </div>
 
       {/* 2. Main Hero Recommendation Card */}
-      <div className="bg-gradient-to-r from-surface via-surface to-surfaceHover border border-primary/40 rounded-3xl p-6 md:p-8 relative overflow-hidden shadow-xl shadow-primary/5">
+      <div className="bg-surface border border-primary/35 rounded-3xl p-6 md:p-8 relative overflow-hidden shadow-xl">
         <div className="absolute -right-12 -bottom-12 w-64 h-64 bg-primary/10 rounded-full blur-3xl pointer-events-none"></div>
 
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-6 relative z-10">
@@ -141,7 +141,7 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
 
               <div className="bg-surface/80 border border-surfaceBorder px-4 py-2 rounded-xl text-xs">
                 <span className="text-slate-400">Hit Cost:</span>{" "}
-                <strong className="text-cyan-400 font-mono text-sm ml-1">-{topPlan?.hits ? topPlan.hits * 4 : 0} pts</strong>
+                <strong className="text-secondary font-mono text-sm ml-1">-{topPlan?.hits ? topPlan.hits * 4 : 0} pts</strong>
               </div>
 
               <div className="bg-surface/80 border border-surfaceBorder px-4 py-2 rounded-xl text-xs">
@@ -168,7 +168,7 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
               className="bg-surfaceHover hover:bg-surfaceBorder text-slate-100 border border-surfaceBorder font-semibold px-6 py-3.5 rounded-xl text-sm flex items-center justify-center gap-2 transition-all"
             >
               <Bot className="w-4 h-4 text-secondary" />
-              <span>ASK GROUNDED AI</span>
+              <span>EXPLAIN THIS PLAN</span>
             </button>
           </div>
         </div>
@@ -226,11 +226,11 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
             {captainPicks?.diamond ? (
               <div className="bg-surfaceHover/60 border border-surfaceBorder rounded-xl p-3 flex items-center justify-between">
                 <div>
-                  <div className="text-[10px] font-bold text-cyan-400 uppercase tracking-wider">DIAMOND (Balanced)</div>
+                  <div className="text-[10px] font-bold text-secondary uppercase tracking-wider">DIAMOND (Balanced)</div>
                   <div className="font-bold text-slate-100 text-sm mt-0.5">{captainPicks.diamond.web_name}</div>
                 </div>
                 <div className="text-right font-mono">
-                  <div className="text-sm font-extrabold text-cyan-400">{captainPicks.diamond.mean_xp.toFixed(1)} xP</div>
+                  <div className="text-sm font-extrabold text-secondary">{captainPicks.diamond.mean_xp.toFixed(1)} xP</div>
                   <div className="text-[10px] text-slate-400">Top xP Balance</div>
                 </div>
               </div>
@@ -239,11 +239,11 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
             {captainPicks?.sword ? (
               <div className="bg-surfaceHover/60 border border-surfaceBorder rounded-xl p-3 flex items-center justify-between">
                 <div>
-                  <div className="text-[10px] font-bold text-purple-400 uppercase tracking-wider">SWORD (Differential)</div>
+                  <div className="text-[10px] font-bold text-rose-300 uppercase tracking-wider">SWORD (Differential)</div>
                   <div className="font-bold text-slate-100 text-sm mt-0.5">{captainPicks.sword.web_name}</div>
                 </div>
                 <div className="text-right font-mono">
-                  <div className="text-sm font-extrabold text-purple-400">{captainPicks.sword.mean_xp.toFixed(1)} xP</div>
+                  <div className="text-sm font-extrabold text-rose-300">{captainPicks.sword.mean_xp.toFixed(1)} xP</div>
                   <div className="text-[10px] text-slate-400">High Ceiling</div>
                 </div>
               </div>
@@ -307,7 +307,7 @@ export const OverviewDashboard: React.FC<OverviewDashboardProps> = ({
         <div className="bg-surface border border-surfaceBorder rounded-2xl p-6 space-y-4">
           <div className="flex items-center justify-between">
             <h3 className="font-bold text-slate-100 flex items-center gap-2 text-base">
-              <Zap className="w-5 h-5 text-cyan-400" />
+              <Zap className="w-5 h-5 text-secondary" />
               <span>Chip Strategy Radar</span>
             </h3>
             <button

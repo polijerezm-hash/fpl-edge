@@ -19,11 +19,12 @@ class StrategyEngine:
         Classifies top starting XI players into Shield, Diamond, and Sword strategy profiles.
         """
         candidates = []
+        rejected = []
         for pid in starting_xi_pids:
             proj = projections.get(pid)
             player = players_dict.get(pid)
             if proj and player:
-                candidates.append({
+                candidate = {
                     "player_id": pid,
                     "web_name": player.web_name,
                     "team_id": player.team_id,
@@ -33,37 +34,70 @@ class StrategyEngine:
                     "p90_xp": proj.p90_xp,
                     "xmins": proj.xmins,
                     "start_prob": proj.start_probability,
-                    "selected_by_pct": player.selected_by_pct
-                })
+                    "selected_by_pct": player.selected_by_pct,
+                }
+                reasons = []
+                if player.position.value == "GKP":
+                    reasons.append("goalkeepers are excluded from captain recommendations")
+                if not player.can_select or player.status in {"i", "s", "u"}:
+                    reasons.append("player is unavailable")
+                if proj.start_probability < 0.55:
+                    reasons.append("start probability is below 55%")
+                if proj.xmins < 45.0:
+                    reasons.append("expected minutes are below 45")
+                if proj.fixtures_count < 1:
+                    reasons.append("player has no fixture")
+
+                if reasons:
+                    rejected.append({**candidate, "reasons": reasons})
+                else:
+                    candidates.append(candidate)
 
         candidates.sort(key=lambda c: c["mean_xp"], reverse=True)
 
         if not candidates:
-            return {"shield": None, "diamond": None, "sword": None, "ranked": []}
+            return {
+                "shield": None,
+                "diamond": None,
+                "sword": None,
+                "ranked": [],
+                "rejected": rejected,
+                "status": "no_eligible_outfield_captain",
+            }
 
-        # Prefer outfield candidates for captaincy recommendations
-        outfield_candidates = [c for c in candidates if c["position"] != "GKP"]
-        pool = outfield_candidates if outfield_candidates else candidates
+        pool = candidates
 
-        # 1. Diamond: Highest mean xP among outfielders
-        diamond = pool[0]
+        # Diamond: strongest central forecast.
+        diamond = max(pool, key=lambda c: c["mean_xp"])
 
-        # 2. Shield: Highest ownership / start probability among top xP outfield candidates
-        top_candidates = pool[:min(4, len(pool))]
-        shield = max(top_candidates, key=lambda c: c["selected_by_pct"] * 0.5 + c["start_prob"] * 50.0)
+        # Shield: reward floor, minutes security and ownership without overwhelming EV.
+        shield = max(
+            pool,
+            key=lambda c: (
+                0.45 * c["mean_xp"]
+                + 0.35 * c["p10_xp"]
+                + 0.012 * c["selected_by_pct"]
+                + 0.45 * c["start_prob"]
+            ),
+        )
 
-        # 3. Sword: Highest P90 ceiling among differential outfield candidates (< 30% selected)
-        differentials = [c for c in pool if c["selected_by_pct"] < 30.0]
+        # Sword: ceiling-led, but still requires a credible start.
+        differentials = [
+            c for c in pool
+            if c["selected_by_pct"] < 30.0 and c["start_prob"] >= 0.65 and c["xmins"] >= 55.0
+        ]
         if differentials:
-            sword = max(differentials, key=lambda c: c["p90_xp"])
+            sword = max(differentials, key=lambda c: 0.70 * c["p90_xp"] + 0.30 * c["mean_xp"])
         else:
-            sword = max(pool, key=lambda c: c["p90_xp"])
+            sword = max(pool, key=lambda c: 0.70 * c["p90_xp"] + 0.30 * c["mean_xp"])
 
         return {
             "shield": shield,
             "diamond": diamond,
             "sword": sword,
-            "ranked": candidates
+            "ranked": candidates,
+            "rejected": rejected,
+            "status": "ready",
         }
 
     def analyze_chips(

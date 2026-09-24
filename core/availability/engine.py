@@ -1,190 +1,198 @@
-import numpy as np
-from typing import List, Dict, Any, Optional
-from core.data.models import Player, Team, Availability, Position
+from typing import Dict, List
+
+from core.data.models import Availability, Player, Position, Team
+
 
 class AvailabilityEngine:
+    """Estimate role, start probability, appearance probability and expected minutes.
+
+    The official FPL feed exposes season-to-date usage rather than a predicted team
+    sheet. This model shrinks observed starts/minutes toward a conservative role prior
+    and reconciles each club to one goalkeeper and ten outfield starts.
     """
-    Estimates expected minutes and start probabilities for players per fixture.
-    Accurately distinguishes primary starting goalkeepers from backup goalkeepers,
-    and uses real season minutes/starts data to establish accurate start probabilities.
-    """
-    def __init__(self):
-        pass
+
+    UNAVAILABLE_STATUSES = {"i", "s", "u"}
+
+    @staticmethod
+    def _status_multiplier(player: Player) -> float:
+        if not player.can_select or player.status in AvailabilityEngine.UNAVAILABLE_STATUSES:
+            return 0.0
+        if player.status == "d":
+            chance = player.chance_of_playing_next_round
+            return max(0.0, min(1.0, float(75 if chance is None else chance) / 100.0))
+        return 1.0
+
+    @staticmethod
+    def _role_prior(player: Player) -> float:
+        """Pre-season/new-signing prior that avoids treating every zero as a starter."""
+        ownership = min(1.0, max(0.0, player.selected_by_pct / 30.0))
+        ep_signal = min(1.0, max(0.0, player.ep_next / 5.0))
+        price_floor = {
+            Position.GKP: 4.0,
+            Position.DEF: 4.0,
+            Position.MID: 4.5,
+            Position.FWD: 4.5,
+        }[player.position]
+        price_signal = min(1.0, max(0.0, (player.current_price - price_floor) / 4.0))
+        prior = 0.12 + 0.52 * ownership + 0.12 * ep_signal + 0.24 * price_signal
+        return min(0.92, max(0.03, prior))
 
     def estimate_player_availability(
         self,
         player: Player,
         team: Team,
         is_home: bool,
-        is_primary_gkp: bool = True
+        is_primary_gkp: bool = True,
     ) -> Availability:
-        # Base status multiplier based on official status and status text
-        status_mult = 1.0
-        if player.status == "d":
-            status_mult = (player.chance_of_playing_next_round if player.chance_of_playing_next_round is not None else 75) / 100.0
-        elif player.status in ["i", "s", "u"]:
-            status_mult = 0.0
+        status_mult = self._status_multiplier(player)
+        prior = self._role_prior(player)
 
-        # Baseline start probability by position / tier
         if player.position == Position.GKP:
-            if is_primary_gkp and status_mult > 0:
-                base_p_start = 0.95 * status_mult
-                e_mins_start = 90.0
-                p_sub = 0.01 * status_mult
-                e_mins_sub = 15.0
-            else:
-                # Backup / reserve goalkeeper
-                base_p_start = 0.0
-                e_mins_start = 0.0
-                p_sub = 0.01 * status_mult
-                e_mins_sub = 10.0
+            chance_start = (0.94 if is_primary_gkp else 0.02) * status_mult
+            chance_sub = (0.01 if is_primary_gkp else 0.03) * status_mult
+            minutes_if_start = 90.0
+            minutes_if_sub = 10.0
         else:
-            # Outfield players (DEF, MID, FWD)
             if player.starts > 0 or player.minutes > 0:
-                # Based on actual playing history
-                # Assuming max team minutes is roughly 90 * GWs played
-                mins_per_game = player.minutes / max(1, player.starts if player.starts > 0 else 1)
-                
-                # Estimate role
-                if player.starts >= 3 or player.minutes >= 270:
-                    # Regular starter
-                    base_p_start = min(0.95, 0.75 + 0.20 * min(1.0, player.minutes / 450.0)) * status_mult
-                    e_mins_start = min(90.0, max(75.0, mins_per_game))
-                    p_sub = min(0.20, (1.0 - base_p_start) * 0.5)
-                    e_mins_sub = 22.0
-                elif player.minutes >= 90:
-                    # Rotation player
-                    base_p_start = 0.45 * status_mult
-                    e_mins_start = 70.0
-                    p_sub = 0.35 * status_mult
-                    e_mins_sub = 25.0
-                else:
-                    # Fringe / bench player
-                    base_p_start = 0.10 * status_mult
-                    e_mins_start = 65.0
-                    p_sub = 0.25 * status_mult
-                    e_mins_sub = 20.0
+                inferred_matches = max(1.0, float(player.starts), player.minutes / 90.0)
+                start_share = min(1.0, player.starts / inferred_matches)
+                minutes_share = min(1.0, player.minutes / (90.0 * inferred_matches))
+                observed_role = 0.65 * start_share + 0.35 * minutes_share
+                evidence = min(0.85, inferred_matches / 8.0)
+                chance_start = (evidence * observed_role + (1.0 - evidence) * prior) * status_mult
             else:
-                # 0 minutes played so far
-                price_factor = min(1.0, max(0.0, (player.current_price - 4.0) / 8.0))
-                if player.current_price >= 7.0:
-                    # High price marquee player who hasn't played yet (e.g. new transfer/returning)
-                    base_p_start = 0.60 * status_mult
-                    e_mins_start = 75.0
-                    p_sub = 0.25 * status_mult
-                    e_mins_sub = 20.0
-                elif player.current_price >= 5.5:
-                    base_p_start = 0.25 * status_mult
-                    e_mins_start = 70.0
-                    p_sub = 0.30 * status_mult
-                    e_mins_sub = 20.0
-                else:
-                    # Cheap non-playing budget enabler
-                    base_p_start = 0.02 * status_mult
-                    e_mins_start = 60.0
-                    p_sub = 0.08 * status_mult
-                    e_mins_sub = 15.0
+                chance_start = prior * status_mult
 
-        raw_e_mins = base_p_start * e_mins_start + p_sub * e_mins_sub
+            chance_start = min(0.96, max(0.0, chance_start))
+            chance_sub = min(0.35, (1.0 - chance_start) * (0.30 if chance_start < 0.55 else 0.12)) * status_mult
+            minutes_if_start = 84.0 if player.position == Position.DEF else 78.0
+            minutes_if_sub = 21.0
+
+        expected_minutes = chance_start * minutes_if_start + chance_sub * minutes_if_sub
+        chance_appearance = min(1.0, chance_start + chance_sub)
 
         return Availability(
             player_id=player.player_id,
             as_of_timestamp="",
             status=player.status,
-            chance_start=round(base_p_start, 3),
-            chance_appearance=round(min(1.0, base_p_start + p_sub), 3),
+            chance_start=round(chance_start, 3),
+            chance_appearance=round(chance_appearance, 3),
+            p_start=round(chance_start, 3),
+            p_sub=round(chance_sub, 3),
+            minutes_if_start=minutes_if_start,
+            minutes_if_sub=minutes_if_sub,
+            expected_minutes=round(expected_minutes, 1),
             expected_return=player.news,
-            source="rule_based_availability_engine",
-            confidence=0.90 if player.status == "a" else 0.50
+            source="role_and_usage_model_v2",
+            confidence=0.88 if player.starts >= 4 and status_mult == 1.0 else 0.62,
+            model_version="2.0.0",
         )
+
+    @staticmethod
+    def _normalise_probabilities(raw: Dict[int, float], target: float, cap: float = 0.97) -> Dict[int, float]:
+        """Scale role scores to a team-level starting total while respecting caps."""
+        result = {pid: 0.0 for pid in raw}
+        active = {pid for pid, value in raw.items() if value > 0.0}
+        remaining = min(target, float(len(active)))
+
+        while active and remaining > 1e-8:
+            total = sum(raw[pid] for pid in active)
+            if total <= 0:
+                break
+            scale = remaining / total
+            capped = {pid for pid in active if raw[pid] * scale >= cap}
+            if not capped:
+                for pid in active:
+                    result[pid] = raw[pid] * scale
+                break
+            for pid in capped:
+                result[pid] = cap
+                remaining -= cap
+            active -= capped
+
+        return result
 
     def reconcile_team_availability(
         self,
         team_players: List[Player],
         team: Team,
-        is_home: bool
+        is_home: bool,
     ) -> Dict[int, Dict[str, float]]:
-        """
-        Reconciles starting probabilities across a team squad so the sum of start
-        probabilities across all squad players equals exactly 11.0 (1 GKP + 10 outfield).
-        """
         if not team_players:
             return {}
 
-        # 1. Identify primary goalkeeper
-        gkps = [p for p in team_players if p.position == Position.GKP]
-        primary_gkp_id = None
-        if gkps:
-            # Sort by healthy status, minutes played, starts, ep_next, selected_by_pct, price
-            sorted_gkps = sorted(
-                gkps,
-                key=lambda p: (
-                    1 if p.status == "a" else (0.5 if p.status == "d" else 0),
-                    p.minutes,
-                    p.starts,
-                    p.ep_next,
-                    p.selected_by_pct,
-                    p.current_price
-                ),
-                reverse=True
-            )
-            primary_gkp_id = sorted_gkps[0].player_id
+        inferred_team_matches = max(
+            [0.0]
+            + [float(player.starts) for player in team_players]
+            + [player.minutes / 90.0 for player in team_players]
+        )
+        has_usage_sample = inferred_team_matches >= 1.0
 
-        raw_avail = {}
-        for p in team_players:
-            is_prim_gkp = (p.player_id == primary_gkp_id) if p.position == Position.GKP else False
-            avail = self.estimate_player_availability(p, team, is_home, is_primary_gkp=is_prim_gkp)
-            
-            raw_avail[p.player_id] = {
-                "player": p,
-                "avail": avail,
-                "p_start": avail.chance_start,
-                "e_mins_start": 90.0 if p.position == Position.GKP else 80.0,
-                "p_sub": 0.02 if p.position == Position.GKP else min(0.35, (1.0 - avail.chance_start) * 0.5),
-                "e_mins_sub": 15.0 if p.position == Position.GKP else 22.0
-            }
+        gkps = [player for player in team_players if player.position == Position.GKP]
+        outfielders = [player for player in team_players if player.position != Position.GKP]
 
-        # Separate GKP and Outfielders for reconciliation
-        reconciled = {}
-        outfield_items = {pid: item for pid, item in raw_avail.items() if item["player"].position != Position.GKP}
-        gkp_items = {pid: item for pid, item in raw_avail.items() if item["player"].position == Position.GKP}
-
-        # GKP Reconciliation (exactly 1.0 total starter for GKP)
-        for pid, item in gkp_items.items():
-            p_start = item["p_start"]
-            p_sub = item["p_sub"] if item["player"].status == "a" else 0.0
-            e_mins = round((p_start * 90.0) + (p_sub * 15.0), 1)
-            reconciled[pid] = {
-                "start_probability": round(p_start, 3),
-                "sub_probability": round(p_sub, 3),
-                "expected_minutes": round(e_mins, 1)
-            }
-
-        # Outfielder Reconciliation (exactly 10.0 target starters for outfield)
-        total_outfield_p_start = sum(item["p_start"] for item in outfield_items.values())
-        target_outfield = min(10.0, float(len(outfield_items)))
-        
-        if total_outfield_p_start > 0:
-            scaling = target_outfield / total_outfield_p_start
-        else:
-            scaling = 1.0
-
-        for pid, item in outfield_items.items():
-            # Apply soft scaling to prevent key starters (>0.75) from being overly crushed
-            raw_p = item["p_start"]
-            if raw_p >= 0.70:
-                rec_p = min(0.95, max(0.65, raw_p * max(0.85, min(1.15, scaling))))
+        gkp_scores: Dict[int, float] = {}
+        for player in gkps:
+            status_mult = self._status_multiplier(player)
+            if status_mult == 0:
+                gkp_scores[player.player_id] = 0.0
+                continue
+            if has_usage_sample:
+                start_share = min(1.0, player.starts / inferred_team_matches)
+                minute_share = min(1.0, player.minutes / (90.0 * inferred_team_matches))
+                score = 0.75 * start_share + 0.25 * minute_share
+                score += 0.04 * self._role_prior(player)
             else:
-                rec_p = min(0.85, max(0.0, raw_p * scaling))
+                score = self._role_prior(player)
+            gkp_scores[player.player_id] = max(0.001, score * status_mult)
 
-            p_sub = min(0.40, (1.0 - rec_p) * 0.5) if item["player"].status == "a" else 0.0
-            e_mins = (rec_p * item["e_mins_start"]) + (p_sub * item["e_mins_sub"])
-            e_mins = round(min(90.0, max(0.0, e_mins)), 1)
+        gkp_probs = self._normalise_probabilities(gkp_scores, 1.0, cap=0.98)
 
-            reconciled[pid] = {
-                "start_probability": round(rec_p, 3),
-                "sub_probability": round(p_sub, 3),
-                "expected_minutes": e_mins
+        outfield_scores: Dict[int, float] = {}
+        for player in outfielders:
+            status_mult = self._status_multiplier(player)
+            if status_mult == 0:
+                outfield_scores[player.player_id] = 0.0
+                continue
+
+            prior = self._role_prior(player)
+            if has_usage_sample:
+                start_share = min(1.0, player.starts / inferred_team_matches)
+                minute_share = min(1.0, player.minutes / (90.0 * inferred_team_matches))
+                observed = 0.65 * start_share + 0.35 * minute_share
+                evidence = min(0.88, inferred_team_matches / 8.0)
+                role_score = evidence * observed + (1.0 - evidence) * prior
+            else:
+                role_score = prior
+            outfield_scores[player.player_id] = max(0.001, role_score * status_mult)
+
+        target_outfield = min(10.0, float(sum(value > 0 for value in outfield_scores.values())))
+        outfield_probs = self._normalise_probabilities(outfield_scores, target_outfield, cap=0.97)
+
+        reconciled: Dict[int, Dict[str, float]] = {}
+        for player in team_players:
+            if player.position == Position.GKP:
+                chance_start = gkp_probs.get(player.player_id, 0.0)
+                chance_sub = min(0.03, max(0.0, 1.0 - chance_start) * 0.03) * self._status_multiplier(player)
+                minutes_if_start = 90.0
+                minutes_if_sub = 10.0
+            else:
+                chance_start = outfield_probs.get(player.player_id, 0.0)
+                substitution_share = 0.30 if chance_start < 0.55 else 0.12
+                chance_sub = min(0.35, max(0.0, 1.0 - chance_start) * substitution_share)
+                chance_sub *= self._status_multiplier(player)
+                minutes_if_start = 84.0 if player.position == Position.DEF else 78.0
+                if player.minutes and player.starts:
+                    observed_start_minutes = player.minutes / max(1, player.starts)
+                    minutes_if_start = min(90.0, max(62.0, observed_start_minutes))
+                minutes_if_sub = 21.0
+
+            expected_minutes = chance_start * minutes_if_start + chance_sub * minutes_if_sub
+            reconciled[player.player_id] = {
+                "start_probability": round(chance_start, 3),
+                "appearance_probability": round(min(1.0, chance_start + chance_sub), 3),
+                "sub_probability": round(chance_sub, 3),
+                "expected_minutes": round(min(90.0, max(0.0, expected_minutes)), 1),
             }
 
         return reconciled

@@ -53,8 +53,8 @@ def test_validate_optimiser_plan_checks():
             "transfers_out": [],
             "starters": starters,
             "bench": bench,
-            "captain": starters[0],
-            "vice_captain": starters[1],
+            "captain": starters[4],
+            "vice_captain": starters[5],
             "bank": 0.8
         }]
     }

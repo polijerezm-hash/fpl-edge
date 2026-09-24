@@ -55,7 +55,7 @@ export const TransferPlanner: React.FC<TransferPlannerProps> = ({
               <span>Transfer Planner & Squad Optimizer</span>
             </h2>
             <p className="text-xs text-slate-400 mt-1">
-              Mixed Integer Linear Programming (MILP) solver evaluating 1-5 GW transfer horizons and HOLD strategy.
+            Compare transfer paths over 1–5 gameweeks, including the value of simply rolling.
             </p>
           </div>
 
@@ -162,7 +162,7 @@ export const TransferPlanner: React.FC<TransferPlannerProps> = ({
                   <span className={`w-6 h-6 rounded-full text-xs flex items-center justify-center font-extrabold ${
                     isSelected ? "bg-primary text-slate-950" : "bg-surfaceBorder text-slate-300"
                   }`}>
-                    {plan.plan_code || chr(65 + idx)}
+                    {plan.plan_code || String.fromCharCode(65 + idx)}
                   </span>
 
                   <div>
@@ -275,7 +275,7 @@ export const TransferPlanner: React.FC<TransferPlannerProps> = ({
                 </div>
               </div>
 
-              {/* WHY THIS PLAN Narrative & AI Button */}
+              {/* Plan explanation */}
               <div className="bg-surfaceHover/80 border border-surfaceBorder rounded-2xl p-5 flex flex-col md:flex-row md:items-center justify-between gap-4">
                 <div>
                   <h4 className="font-bold text-slate-100 text-sm flex items-center gap-2">
@@ -293,7 +293,7 @@ export const TransferPlanner: React.FC<TransferPlannerProps> = ({
                   className="bg-secondary/10 hover:bg-secondary/20 text-secondary border border-secondary/30 px-4 py-2.5 rounded-xl text-xs font-bold transition-colors shrink-0 flex items-center gap-1.5"
                 >
                   <Sparkles className="w-3.5 h-3.5" />
-                  <span>Ask AI Explanation</span>
+                  <span>Explain this plan</span>
                 </button>
               </div>
             </div>

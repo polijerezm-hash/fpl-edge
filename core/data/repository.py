@@ -68,23 +68,30 @@ class DataRepository:
                 details={"errors": errors}
             )
 
-        # 3. Determine current gameweek and deadline
+        # 3. Determine the decision gameweek. Once a deadline has passed, FPL's
+        # `is_current` event is the live/just-finished round; recommendations must
+        # target `is_next` instead.
         active_gw = 1
         current_deadline = None
         for g in candidate_gameweeks:
-            if g.is_current:
+            if g.is_next:
                 active_gw = g.gameweek
                 current_deadline = g.deadline_time
                 break
         if not current_deadline:
             for g in candidate_gameweeks:
-                if g.is_next:
+                if g.is_current:
                     active_gw = g.gameweek
                     current_deadline = g.deadline_time
                     break
 
         snap_id = f"snap_{int(time.time())}_{self.data_mode}_gw{active_gw}"
-        season_name = "2024/25" if self.data_mode == "live" else "2024/25 (Demo)"
+        season_start = now_str[:4]
+        current_month = int(now_str[5:7])
+        start_year = int(season_start) if current_month >= 7 else int(season_start) - 1
+        season_name = f"{start_year}/{str(start_year + 1)[-2:]}"
+        if self.data_mode == "demo":
+            season_name += " (Demo)"
 
         new_snapshot = Snapshot(
             snapshot_id=snap_id,
@@ -176,6 +183,17 @@ class DataRepository:
             )
 
         return manager_state
+
+    def get_manager_leagues(self, manager_id: int) -> List[Dict[str, Any]]:
+        return self.provider.get_manager_leagues(manager_id)
+
+    def get_mini_league_analysis(self, manager_id: int, league_id: int) -> Dict[str, Any]:
+        return self.provider.get_mini_league_analysis(
+            manager_id=manager_id,
+            league_id=league_id,
+            gameweek=self.get_current_gameweek(),
+            players=self.get_players(),
+        )
 
     def save_custom_manager_state(self, manager_state: ManagerState):
         manager_state.snapshot_id = self.current_snapshot.snapshot_id

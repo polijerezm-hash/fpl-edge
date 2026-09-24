@@ -45,3 +45,18 @@ def test_api_refresh_endpoint_demo():
     data = resp.json()
     assert data["validated"] is True
     assert data["data_mode"] == "demo"
+
+def test_demo_mini_leagues_and_differentials():
+    leagues_resp = client.get("/api/mini-leagues?manager_id=99999&data_mode=demo")
+    assert leagues_resp.status_code == 200
+    leagues = leagues_resp.json()["leagues"]
+    assert len(leagues) >= 1
+
+    analysis_resp = client.get(
+        f"/api/mini-leagues/{leagues[0]['id']}/analysis?manager_id=99999&data_mode=demo"
+    )
+    assert analysis_resp.status_code == 200
+    analysis = analysis_resp.json()
+    assert analysis["sample_size"] > 0
+    assert "differentials" in analysis
+    assert "threats" in analysis

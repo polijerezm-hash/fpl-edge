@@ -38,6 +38,8 @@ app.add_middleware(
 
 # Dedicated Repositories for logical and physical snapshot isolation
 _repositories: Dict[str, DataRepository] = {}
+_decision_cache: Dict[tuple, Dict[str, Any]] = {}
+_captaincy_cache: Dict[tuple, Dict[str, Any]] = {}
 
 def get_repo(data_mode: str = "live") -> DataRepository:
     mode = "demo" if data_mode.lower() == "demo" else "live"
@@ -312,7 +314,8 @@ def run_optimization(req: OptimizeRequest):
     opt_result["plans"] = validated_plans
     opt_result["snapshot_id"] = repo.get_snapshot_id()
     opt_result["as_of_timestamp"] = repo.get_as_of_timestamp()
-    opt_result["model_version"] = "1.0.0"
+    opt_result["model_version"] = "2.0.0"
+    _decision_cache[(req.data_mode.lower(), req.manager_id)] = opt_result
     return opt_result
 
 @app.post("/api/captaincy")
@@ -324,11 +327,64 @@ def get_captaincy_picks(manager_id: int = Query(1), data_mode: str = Query("live
     players_dict = {p.player_id: p for p in repo.get_players()}
 
     starting_xi = [sp.player_id for sp in manager_state.squad if sp.starting]
-    return strategy_engine.get_captain_recommendations(
+    result = strategy_engine.get_captain_recommendations(
         starting_xi_pids=starting_xi,
         projections=projections,
         players_dict=players_dict
     )
+    result["gameweek"] = current_gw
+    result["snapshot_id"] = repo.get_snapshot_id()
+    result["model_version"] = "2.0.0"
+    _captaincy_cache[(data_mode.lower(), manager_id)] = result
+    return result
+
+@app.get("/api/mini-leagues")
+def get_mini_leagues(manager_id: int = Query(...), data_mode: str = Query("live")):
+    repo = get_repo(data_mode)
+    return {
+        "manager_id": manager_id,
+        "gameweek": repo.get_current_gameweek(),
+        "leagues": repo.get_manager_leagues(manager_id),
+    }
+
+@app.get("/api/mini-leagues/{league_id}/analysis")
+def get_mini_league_analysis(
+    league_id: int,
+    manager_id: int = Query(...),
+    data_mode: str = Query("live"),
+):
+    repo = get_repo(data_mode)
+    analysis = repo.get_mini_league_analysis(manager_id, league_id)
+    projections = _get_all_projections_for_gw(repo.get_current_gameweek(), data_mode=data_mode)
+
+    for exposure in analysis.get("exposures", []):
+        projection = projections.get(exposure["player_id"])
+        exposure["mean_xp"] = projection.mean_xp if projection else 0.0
+        exposure["xmins"] = projection.xmins if projection else 0.0
+        if exposure.get("you_own"):
+            exposure["edge_score"] = round(
+                (100.0 * exposure.get("your_multiplier", 0) - exposure.get("league_eo", 0.0))
+                * exposure["mean_xp"] / 100.0,
+                2,
+            )
+        else:
+            exposure["threat_score"] = round(
+                exposure.get("league_eo", 0.0) * exposure["mean_xp"] / 100.0,
+                2,
+            )
+
+    analysis["differentials"] = sorted(
+        [row for row in analysis.get("exposures", []) if row.get("you_own") and row.get("league_eo", 0) < 75],
+        key=lambda row: row.get("edge_score", 0),
+        reverse=True,
+    )[:8]
+    analysis["threats"] = sorted(
+        [row for row in analysis.get("exposures", []) if not row.get("you_own") and row.get("league_eo", 0) >= 15],
+        key=lambda row: row.get("threat_score", 0),
+        reverse=True,
+    )[:8]
+    analysis["snapshot_id"] = repo.get_snapshot_id()
+    return analysis
 
 @app.post("/api/chips/analyse")
 def analyze_chips(manager_id: int = Query(1), data_mode: str = Query("live")):
@@ -351,26 +407,53 @@ def ask_assistant(req: AssistantRequest):
     repo = get_repo(req.data_mode)
     manager_state = repo.get_manager_state(req.manager_id)
     all_players = repo.get_players()
-    teams = repo.get_teams()
     current_gw = repo.get_current_gameweek()
 
-    projections_by_gw = {current_gw: _get_all_projections_for_gw(current_gw, data_mode=req.data_mode)}
-    
-    opt_result = optimizer_engine.optimize_squad(
-        manager_state=manager_state,
-        all_players=all_players,
-        teams=teams,
-        projections_by_gw=projections_by_gw,
-        horizon=1,
-        top_n_plans=3,
-        free_transfers_override=manager_state.free_transfers
-    )
+    cache_key = (req.data_mode.lower(), req.manager_id)
+    opt_result = _decision_cache.get(cache_key)
+    if not opt_result or opt_result.get("snapshot_id") != repo.get_snapshot_id():
+        projections_by_gw = {current_gw: _get_all_projections_for_gw(current_gw, data_mode=req.data_mode)}
+        opt_result = optimizer_engine.optimize_squad(
+            manager_state=manager_state,
+            all_players=all_players,
+            teams=repo.get_teams(),
+            projections_by_gw=projections_by_gw,
+            horizon=1,
+            top_n_plans=3,
+            free_transfers_override=manager_state.free_transfers
+        )
+        opt_result["snapshot_id"] = repo.get_snapshot_id()
+        opt_result["as_of_timestamp"] = repo.get_as_of_timestamp()
+        opt_result["model_version"] = "2.0.0"
+        _decision_cache[cache_key] = opt_result
 
     plans = opt_result.get("plans", [])
     rec_plan = plans[req.plan_index] if len(plans) > req.plan_index else (plans[0] if plans else {})
     alt_plans = [p for i, p in enumerate(plans) if i != req.plan_index]
 
-    player_lookup = {str(p.player_id): p.model_dump() for p in all_players}
+    captaincy = _captaincy_cache.get(cache_key)
+    if not captaincy or captaincy.get("snapshot_id") != repo.get_snapshot_id():
+        projections = _get_all_projections_for_gw(current_gw, data_mode=req.data_mode)
+        players_dict = {p.player_id: p for p in all_players}
+        starting_xi = [sp.player_id for sp in manager_state.squad if sp.starting]
+        captaincy = strategy_engine.get_captain_recommendations(starting_xi, projections, players_dict)
+        captaincy["snapshot_id"] = repo.get_snapshot_id()
+        _captaincy_cache[cache_key] = captaincy
+
+    referenced_ids = {sp.player_id for sp in manager_state.squad}
+    for plan in [rec_plan, *alt_plans]:
+        for step in plan.get("gameweeks", []):
+            referenced_ids.update(step.get("transfers_in", []))
+            referenced_ids.update(step.get("transfers_out", []))
+            referenced_ids.update([step.get("captain"), step.get("vice_captain")])
+    for candidate in captaincy.get("ranked", []):
+        referenced_ids.add(candidate.get("player_id"))
+    referenced_ids.discard(None)
+    player_lookup = {
+        str(p.player_id): p.model_dump()
+        for p in all_players
+        if p.player_id in referenced_ids
+    }
 
     # Build DECISION_CONTEXT
     decision_ctx = explainer_engine.build_decision_context(
@@ -378,7 +461,9 @@ def ask_assistant(req: AssistantRequest):
         recommendation_plan=rec_plan,
         alternative_plans=alt_plans,
         player_lookup=player_lookup,
-        as_of_timestamp=repo.get_as_of_timestamp()
+        as_of_timestamp=repo.get_as_of_timestamp(),
+        model_version="2.0.0",
+        captaincy=captaincy,
     )
 
     return explainer_engine.explain_decision(req.question, decision_ctx)
@@ -407,4 +492,3 @@ if os.path.exists(dist_dir):
         if full_path and os.path.isfile(file_path):
             return FileResponse(file_path)
         return FileResponse(os.path.join(dist_dir, "index.html"))
-

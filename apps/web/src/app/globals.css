@@ -5,6 +5,12 @@
 @layer base {
   body {
     @apply bg-background text-slate-100 font-sans antialiased selection:bg-primary selection:text-black;
+    background-image: linear-gradient(rgba(168, 215, 65, 0.018) 1px, transparent 1px);
+    background-size: 100% 32px;
+  }
+
+  button, input, select {
+    @apply focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/70 focus-visible:ring-offset-2 focus-visible:ring-offset-background;
   }
 }
 
@@ -14,12 +20,22 @@
   height: 6px;
 }
 ::-webkit-scrollbar-track {
-  background: #0b0f19;
+  background: #0d120f;
 }
 ::-webkit-scrollbar-thumb {
-  background: #223152;
+  background: #2c3931;
   border-radius: 4px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #10b981;
+  background: #a8d741;
+}
+
+@layer components {
+  .eyebrow {
+    @apply text-[10px] font-bold uppercase tracking-[0.18em] text-slate-500;
+  }
+
+  .panel {
+    @apply border border-surfaceBorder bg-surface shadow-[0_16px_45px_rgba(0,0,0,0.14)];
+  }
 }

@@ -1,8 +1,7 @@
-import os
-import json
-import requests
 from datetime import datetime
 from typing import List, Dict, Any, Optional
+
+from core.integrations.ai_connectors import FPLAdvisorAI
 
 class GroundedExplainerEngine:
     """
@@ -10,8 +9,9 @@ class GroundedExplainerEngine:
     Uses LLM API if configured, otherwise falls back to deterministic template explanations.
     """
     def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
-        self.model = os.getenv("OPENAI_MODEL", "gpt-6-sol")
+        self.advisor = FPLAdvisorAI(api_key=api_key)
+        self.api_key = self.advisor.api_key
+        self.model = self.advisor.model
 
     def build_decision_context(
         self,
@@ -20,7 +20,7 @@ class GroundedExplainerEngine:
         alternative_plans: List[Dict[str, Any]],
         player_lookup: Dict[int, Dict[str, Any]],
         as_of_timestamp: str = "",
-        model_version: str = "2.0.0",
+        model_version: str = "3.0.0",
         captaincy: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
@@ -150,33 +150,4 @@ class GroundedExplainerEngine:
         )
 
     def _call_llm_api(self, question: str, ctx: Dict[str, Any]) -> Optional[str]:
-        system_prompt = (
-            "You are an analytical Fantasy Premier League assistant.\n"
-            "Use ONLY information contained inside DECISION_CONTEXT.\n"
-            "Never invent expected points, injuries, availability, prices, fixtures, probabilities, or optimizer outputs.\n"
-            "Never recommend or mention a player who is absent from allowed_player_ids.\n"
-            "For captain questions, only use captaincy.ranked; goalkeepers and rejected candidates are forbidden.\n"
-            "If the context cannot answer safely, state that clearly. Explain recommendations produced by deterministic models clearly."
-        )
-        user_prompt = f"DECISION_CONTEXT:\n{json.dumps(ctx, indent=2)}\n\nUSER QUESTION: {question}"
-
-        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-        payload = {
-            "model": self.model,
-            "instructions": system_prompt,
-            "input": user_prompt,
-            "reasoning": {"effort": "medium"},
-            "text": {"verbosity": "low"},
-        }
-        resp = requests.post("https://api.openai.com/v1/responses", headers=headers, json=payload, timeout=20)
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("output_text"):
-                return data["output_text"]
-            parts = []
-            for item in data.get("output", []):
-                for content in item.get("content", []):
-                    if content.get("type") == "output_text" and content.get("text"):
-                        parts.append(content["text"])
-            return "\n".join(parts) or None
-        return None
+        return self.advisor.explain(ctx, question)

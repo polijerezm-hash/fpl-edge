@@ -60,3 +60,14 @@ def test_demo_mini_leagues_and_differentials():
     assert analysis["sample_size"] > 0
     assert "differentials" in analysis
     assert "threats" in analysis
+
+
+def test_chip_analysis_comes_from_joint_solver():
+    response = client.post("/api/chips/analyse?manager_id=99999&data_mode=demo")
+    assert response.status_code == 200
+    payload = response.json()
+    assert set(payload) == {
+        "wildcard", "free_hit", "bench_boost", "triple_captain"
+    }
+    assert all("recommended_gw" in result for result in payload.values())
+    assert all("reasoning" in result for result in payload.values())

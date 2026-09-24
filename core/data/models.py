@@ -18,6 +18,7 @@ class Player(BaseModel):
     position: Position
     current_price: float  # e.g. 12.5
     selected_by_pct: float
+    season_start_price: Optional[float] = None
     can_select: bool = True
     status: str = "a"  # 'a'=available, 'd'=doubtful, 'i'=injured, 's'=suspended, 'u'=unavailable
     chance_of_playing_next_round: Optional[int] = 100
@@ -41,6 +42,10 @@ class Player(BaseModel):
     creativity: float = 0.0
     threat: float = 0.0
     ict_index: float = 0.0
+    # Optional per-Gameweek history from the official element-summary endpoint.
+    # Keeping it on the snapshot lets the projection layer use a real EWMA while
+    # still degrading safely when the public API cannot provide the history.
+    recent_history: List[Dict[str, Any]] = Field(default_factory=list)
 
 class Team(BaseModel):
     team_id: int
@@ -142,7 +147,13 @@ class ManagerState(BaseModel):
     overall_points: int = 0
     overall_rank: int = 100000
     squad: List[SquadPlayer]
-    chips_used: List[str] = []
+    chips_used: List[str] = Field(default_factory=list)
+    chips_available: Dict[str, int] = Field(default_factory=lambda: {
+        "wildcard": 1,
+        "free_hit": 1,
+        "bench_boost": 1,
+        "triple_captain": 1,
+    })
     snapshot_id: Optional[str] = None
 
 class Projection(BaseModel):
@@ -163,7 +174,11 @@ class Projection(BaseModel):
     save_xp: float = 0.0
     bonus_xp: float = 0.0
     fixtures_count: int = 1
-    fixture_ids: List[int] = []
+    fixture_ids: List[int] = Field(default_factory=list)
+    ewma_xp: Optional[float] = None
+    bookie_xp: Optional[float] = None
+    official_xp: Optional[float] = None
+    source_weights: Dict[str, float] = Field(default_factory=dict)
 
 class Snapshot(BaseModel):
     snapshot_id: str

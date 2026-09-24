@@ -159,6 +159,8 @@ class LiveDataValidator:
         initial_bank: float
     ) -> Tuple[bool, List[str]]:
         errors = []
+        # Persistent squad and one-week Free Hit squad are deliberately tracked
+        # separately. A Free Hit must never leak into the following gameweek.
         current_squad = set(initial_squad_pids)
         current_bank = initial_bank
 
@@ -175,6 +177,11 @@ class LiveDataValidator:
             bench = gw_step.get("bench", [])
             captain = gw_step.get("captain")
             vcaptain = gw_step.get("vice_captain")
+            chip = gw_step.get("chip")
+            fh_in = gw_step.get("free_hit_transfers_in", [])
+            fh_out = gw_step.get("free_hit_transfers_out", [])
+            if chip not in {None, "wildcard", "free_hit", "bench_boost", "triple_captain"}:
+                errors.append(f"GW{gw}: Unknown chip {chip}")
 
             # 1. Incoming transfers must exist in snapshot
             for pid in tin:
@@ -184,14 +191,40 @@ class LiveDataValidator:
                     incoming = players_dict[pid]
                     if not incoming.can_select or incoming.status in {"i", "s", "u"}:
                         errors.append(f"GW{gw}: Transfer target {incoming.web_name} is not selectable/available")
+            for pid in fh_in:
+                if pid not in players_dict:
+                    errors.append(f"GW{gw}: Free Hit target player_id {pid} does not exist")
+                else:
+                    incoming = players_dict[pid]
+                    if not incoming.can_select or incoming.status in {"i", "s", "u"}:
+                        errors.append(f"GW{gw}: Free Hit target {incoming.web_name} is unavailable")
 
             # 2. Outgoing transfers must exist in squad prior to transfer
             for pid in tout:
                 if pid not in current_squad:
                     errors.append(f"GW{gw}: Transfer out player_id {pid} was not in manager squad")
+            for pid in fh_out:
+                if pid not in current_squad:
+                    errors.append(f"GW{gw}: Free Hit out player_id {pid} was not in persistent squad")
 
-            # Update squad
+            # Normal/Wildcard transfers change the persistent squad. Free Hit
+            # swaps only create the active squad for this gameweek.
             current_squad = (current_squad - set(tout)) | set(tin)
+            if chip == "free_hit":
+                if tin or tout:
+                    errors.append(f"GW{gw}: Free Hit must not contain persistent transfers")
+                active_squad = (current_squad - set(fh_out)) | set(fh_in)
+            else:
+                if fh_in or fh_out:
+                    errors.append(f"GW{gw}: Free Hit transfers supplied without the Free Hit chip")
+                active_squad = set(current_squad)
+
+            reported_persistent = set(gw_step.get("persistent_squad", current_squad))
+            reported_active = set(gw_step.get("active_squad", active_squad))
+            if reported_persistent != current_squad:
+                errors.append(f"GW{gw}: Reported persistent squad does not match transfers")
+            if reported_active != active_squad:
+                errors.append(f"GW{gw}: Reported active squad does not match chip/transfers")
 
             # 3. Squad size must be 15
             if len(current_squad) != 15:
@@ -199,11 +232,24 @@ class LiveDataValidator:
 
             # 4. Starters & Bench must match current_squad
             combined = set(starters) | set(bench)
-            if combined != current_squad:
-                errors.append(f"GW{gw}: Starters + Bench does not match current squad")
+            if combined != active_squad:
+                errors.append(f"GW{gw}: Starters + Bench does not match active squad")
 
             if len(starters) != 11:
                 errors.append(f"GW{gw}: Starting XI has {len(starters)} players, expected 11")
+            if len(bench) != 4 or len(set(bench)) != 4:
+                errors.append(f"GW{gw}: Ordered bench must contain four unique players")
+            elif (
+                bench[0] not in players_dict
+                or players_dict[bench[0]].position != Position.GKP
+                or any(
+                    pid in players_dict and players_dict[pid].position == Position.GKP
+                    for pid in bench[1:]
+                )
+            ):
+                errors.append(f"GW{gw}: Bench must contain reserve goalkeeper then three outfield substitutes")
+            if len(set(starters)) != 11:
+                errors.append(f"GW{gw}: Starting XI must contain eleven unique players")
 
             # 5. Captain and VC in starters
             if captain not in starters:
@@ -217,7 +263,7 @@ class LiveDataValidator:
 
             # 6. Max 3 per club
             team_counts: Dict[int, int] = {}
-            for pid in current_squad:
+            for pid in active_squad:
                 if pid in players_dict:
                     tid = players_dict[pid].team_id
                     team_counts[tid] = team_counts.get(tid, 0) + 1
@@ -229,5 +275,41 @@ class LiveDataValidator:
             gw_bank = gw_step.get("bank", 0.0)
             if gw_bank < -0.01:
                 errors.append(f"GW{gw}: Bank balance is negative (£{gw_bank}m)")
+
+            # 8. Position and formation checks on the actual gameweek squad.
+            position_counts = {position: 0 for position in Position}
+            for pid in active_squad:
+                if pid in players_dict:
+                    position_counts[players_dict[pid].position] += 1
+            expected = {
+                Position.GKP: 2,
+                Position.DEF: 5,
+                Position.MID: 5,
+                Position.FWD: 3,
+            }
+            for position, count in expected.items():
+                if position_counts[position] != count:
+                    errors.append(
+                        f"GW{gw}: Active squad has {position_counts[position]} {position.value}, expected {count}"
+                    )
+
+            starter_positions = [
+                players_dict[pid].position for pid in starters if pid in players_dict
+            ]
+            if starter_positions.count(Position.GKP) != 1:
+                errors.append(f"GW{gw}: Starting XI must contain exactly one goalkeeper")
+            if not 3 <= starter_positions.count(Position.DEF) <= 5:
+                errors.append(f"GW{gw}: Starting XI must contain 3-5 defenders")
+            if not 2 <= starter_positions.count(Position.MID) <= 5:
+                errors.append(f"GW{gw}: Starting XI must contain 2-5 midfielders")
+            if not 1 <= starter_positions.count(Position.FWD) <= 3:
+                errors.append(f"GW{gw}: Starting XI must contain 1-3 forwards")
+
+            entering_ft = gw_step.get("free_transfers")
+            leaving_ft = gw_step.get("next_free_transfers")
+            if entering_ft is not None and not 1 <= int(entering_ft) <= 5:
+                errors.append(f"GW{gw}: Entering free transfers must be between 1 and 5")
+            if leaving_ft is not None and not 1 <= int(leaving_ft) <= 5:
+                errors.append(f"GW{gw}: Rolled free transfers must be between 1 and 5")
 
         return (len(errors) == 0, errors)

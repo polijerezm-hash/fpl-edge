@@ -1,166 +1,241 @@
+from typing import Any, Dict, List, Optional, Tuple
+
 import pulp
-import numpy as np
-from typing import List, Dict, Any, Optional, Tuple
-from core.data.models import (
-    Player, Team, Fixture, Position, ManagerState, SquadPlayer, Projection
-)
+
+from core.data.models import ManagerState, Player, Position, Projection, Team
+
 
 class PlanGameweekStep(dict):
-    """Represents the tactical decision for a single gameweek in an optimization plan."""
-    pass
+    """Tactical decisions for one gameweek."""
+
 
 class TransferPlan(dict):
-    """Represents a multi-gameweek transfer optimization plan."""
-    pass
+    """A multi-gameweek transfer and chip plan."""
+
 
 class OptimizationEngine:
-    """
-    Mixed Integer Linear Programming (MILP) FPL Squad & Transfer Optimizer using PuLP.
-    Optimizes 1, 3, or 5 Gameweek horizons, respects budget, FT state evolution,
-    hit costs, squad rules, starting XI formation constraints, and returns Top 5 plans.
-    """
+    """Multi-period FPL MILP with transfers, ordered bench and native chips."""
+
+    CHIP_NAMES = ("wildcard", "free_hit", "bench_boost", "triple_captain")
+
     def __init__(self, rules: Optional[Dict[str, Any]] = None):
-        self.rules = rules or {
-            "squad_size": 15, "gkp": 2, "def": 5, "mid": 5, "fwd": 3,
-            "max_club": 3, "hit_cost": 4.0, "max_ft": 5,
-            "bench_weight": 0.12, "free_transfer_value": 2.0,
-            "terminal_ft_value": 0.35, "max_transfers_per_gw": 5,
+        defaults: Dict[str, Any] = {
+            "squad_size": 15,
+            "gkp": 2,
+            "def": 5,
+            "mid": 5,
+            "fwd": 3,
+            "max_club": 3,
+            "hit_cost": 4.0,
+            "max_ft": 5,
+            "time_decay": 0.90,
+            "terminal_ft_value": 1.75,
+            # FPL permits a full squad overhaul; only transfers beyond saved FTs
+            # cost four points. The objective, not an invented hard cap, controls it.
+            "max_transfers_per_gw": 15,
             "minimum_action_edge": 1.0,
-            "min_transfer_xmins": 20.0, "min_transfer_start_probability": 0.20,
-            "min_captain_xmins": 45.0, "min_captain_start_probability": 0.55,
+            "min_transfer_xmins": 20.0,
+            "min_transfer_start_probability": 0.20,
+            "min_captain_xmins": 45.0,
+            "min_captain_start_probability": 0.55,
+            # Slot 0 is the reserve goalkeeper; 1-3 are ordered outfield subs.
+            "bench_slot_weights": {0: 0.03, 1: 0.30, 2: 0.10, 3: 0.03},
+            # Opportunity cost stops a short horizon from burning every chip.
+            "chip_reserve_values": {
+                "wildcard": 12.0,
+                "free_hit": 10.0,
+                "bench_boost": 8.0,
+                "triple_captain": 8.0,
+            },
         }
+        if rules:
+            defaults.update(rules)
+        self.rules = defaults
 
     @staticmethod
     def _risk_adjusted_points(projection: Projection, risk_profile: str) -> float:
-        """Use the forecast distribution; multiplying every player equally changes nothing."""
         if risk_profile == "safe":
             return 0.72 * projection.mean_xp + 0.28 * projection.p10_xp
         if risk_profile == "aggressive":
             return 0.70 * projection.mean_xp + 0.30 * projection.p90_xp
         return projection.mean_xp
 
+    def _candidate_pool(
+        self,
+        all_players: List[Player],
+        manager_state: ManagerState,
+        projections_by_gw: Dict[int, Dict[int, Projection]],
+        target_gws: List[int],
+        locked_player_ids: List[int],
+        banned_player_ids: List[int],
+    ) -> List[Player]:
+        """Keep high-EV options and at least three active budget enablers per position."""
+        if len(all_players) <= 130:
+            return list(all_players)
+
+        mandatory = {sp.player_id for sp in manager_state.squad}
+        mandatory.update(locked_player_ids)
+        mandatory.update(banned_player_ids)
+        selected = set(mandatory)
+        limits = {
+            Position.GKP: 10,
+            Position.DEF: 35,
+            Position.MID: 45,
+            Position.FWD: 25,
+        }
+
+        for position, limit in limits.items():
+            position_players = [p for p in all_players if p.position == position]
+            ranked = sorted(
+                position_players,
+                key=lambda player: sum(
+                    projections_by_gw.get(gw, {}).get(
+                        player.player_id,
+                        Projection(
+                            player_id=player.player_id,
+                            gameweek=gw,
+                            as_of_timestamp="",
+                            xmins=0,
+                            start_probability=0,
+                            mean_xp=0,
+                            p10_xp=0,
+                            p50_xp=0,
+                            p90_xp=0,
+                        ),
+                    ).mean_xp
+                    for gw in target_gws
+                ),
+                reverse=True,
+            )
+            selected.update(player.player_id for player in ranked[:limit])
+
+            budget_enablers = sorted(
+                (
+                    player
+                    for player in position_players
+                    if player.can_select and player.status not in {"i", "s", "u"}
+                ),
+                key=lambda player: (player.current_price, -player.ep_next),
+            )[:3]
+            selected.update(player.player_id for player in budget_enablers)
+
+        return [player for player in all_players if player.player_id in selected]
+
     def optimize_squad(
         self,
         manager_state: ManagerState,
         all_players: List[Player],
         teams: List[Team],
-        projections_by_gw: Dict[int, Dict[int, Projection]], # gw -> player_id -> Projection
+        projections_by_gw: Dict[int, Dict[int, Projection]],
         horizon: int = 3,
-        risk_profile: str = "balanced", # "safe", "balanced", "aggressive"
+        risk_profile: str = "balanced",
         locked_player_ids: Optional[List[int]] = None,
         banned_player_ids: Optional[List[int]] = None,
         custom_mins_overrides: Optional[Dict[int, float]] = None,
         top_n_plans: int = 5,
-        free_transfers_override: Optional[int] = None
+        free_transfers_override: Optional[int] = None,
+        allow_chips: bool = True,
+        forced_chip: Optional[str] = None,
     ) -> Dict[str, Any]:
-        
+        del teams  # Club membership already lives on Player.
         locked_player_ids = locked_player_ids or []
         banned_player_ids = banned_player_ids or []
         custom_mins_overrides = custom_mins_overrides or {}
-
-        # 1. Target Gameweeks
-        target_gws = sorted(list(projections_by_gw.keys()))[:horizon]
+        target_gws = sorted(projections_by_gw)[:horizon]
         if not target_gws:
-            target_gws = [1, 2, 3][:horizon]
+            target_gws = list(range(1, horizon + 1))
 
-        # Free transfers confirmation/override
         if free_transfers_override is not None:
             manager_state = manager_state.model_copy()
-            manager_state.free_transfers = max(1, min(5, free_transfers_override))
+            manager_state.free_transfers = max(
+                1, min(int(self.rules["max_ft"]), int(free_transfers_override))
+            )
             manager_state.free_transfers_confirmed = True
-
-        # 2. Candidate pool selection for solver efficiency
-        squad_pids = set(sp.player_id for sp in manager_state.squad)
-        mandatory_pids = squad_pids | set(locked_player_ids) | set(banned_player_ids)
-
-        if len(all_players) > 130:
-            candidate_pids = set(mandatory_pids)
-            by_pos = {pos: [] for pos in [Position.GKP, Position.DEF, Position.MID, Position.FWD]}
-            for p in all_players:
-                total_xp = sum(
-                    projections_by_gw.get(g, {}).get(p.player_id, Projection(
-                        player_id=p.player_id, gameweek=g, as_of_timestamp="", xmins=0, start_probability=0,
-                        mean_xp=0, p10_xp=0, p50_xp=0, p90_xp=0
-                    )).mean_xp
-                    for g in target_gws
-                )
-                by_pos[p.position].append((total_xp, p.player_id))
-
-            for pos, limit in [(Position.GKP, 10), (Position.DEF, 35), (Position.MID, 45), (Position.FWD, 25)]:
-                by_pos[pos].sort(key=lambda x: x[0], reverse=True)
-                candidate_pids.update(pid for _, pid in by_pos[pos][:limit])
-
-            active_players = [p for p in all_players if p.player_id in candidate_pids]
-        else:
-            active_players = all_players
-
-        # Player buying/selling prices
-        buy_prices = {p.player_id: p.current_price for p in all_players}
-        sell_prices = {}
-        for sp in manager_state.squad:
-            sell_prices[sp.player_id] = sp.selling_price
-        for p in all_players:
-            if p.player_id not in sell_prices:
-                sell_prices[p.player_id] = p.current_price
 
         if risk_profile not in {"safe", "balanced", "aggressive"}:
             risk_profile = "balanced"
+        if forced_chip and forced_chip not in self.CHIP_NAMES:
+            forced_chip = None
 
-        # 3. Create Optimization Problem
-        plans = []
-        excluded_transfer_sets = []
-        seen_plan_signatures = set()
+        active_players = self._candidate_pool(
+            all_players,
+            manager_state,
+            projections_by_gw,
+            target_gws,
+            locked_player_ids,
+            banned_player_ids,
+        )
+        buy_prices = {player.player_id: player.current_price for player in active_players}
+        sell_prices = dict(buy_prices)
+        sell_prices.update({sp.player_id: sp.selling_price for sp in manager_state.squad})
 
-        # Calculate HOLD (do nothing) baseline first
         hold_plan = self._solve_single_pass(
-            manager_state, active_players, target_gws, projections_by_gw,
-            buy_prices, sell_prices, locked_player_ids, banned_player_ids,
-            custom_mins_overrides, risk_profile, force_transfers_limit=0
+            manager_state,
+            active_players,
+            target_gws,
+            projections_by_gw,
+            buy_prices,
+            sell_prices,
+            locked_player_ids,
+            banned_player_ids,
+            custom_mins_overrides,
+            risk_profile,
+            force_transfers_limit=0,
+            allow_chips=False,
         )
         baseline_xp = hold_plan["expected_points"] if hold_plan else 0.0
         baseline_eval = hold_plan["evaluation_score"] if hold_plan else 0.0
 
-        for round_idx in range(top_n_plans):
+        plans: List[Dict[str, Any]] = []
+        excluded_transfer_sets: List[Tuple[int, ...]] = []
+        seen_signatures = set()
+        for round_idx in range(max(1, top_n_plans)):
             plan = self._solve_single_pass(
-                manager_state, active_players, target_gws, projections_by_gw,
-                buy_prices, sell_prices, locked_player_ids, banned_player_ids,
-                custom_mins_overrides, risk_profile,
+                manager_state,
+                active_players,
+                target_gws,
+                projections_by_gw,
+                buy_prices,
+                sell_prices,
+                locked_player_ids,
+                banned_player_ids,
+                custom_mins_overrides,
+                risk_profile,
                 excluded_transfers=excluded_transfer_sets,
-                max_transfers_gw1=2 if round_idx > 0 else None
+                max_transfers_gw1=2 if round_idx else None,
+                allow_chips=allow_chips,
+                forced_chip=forced_chip,
             )
-
             if not plan:
                 break
 
             signature = tuple(
                 (
                     step["gw"],
+                    step.get("chip"),
                     tuple(sorted(step["transfers_out"])),
                     tuple(sorted(step["transfers_in"])),
+                    tuple(sorted(step.get("free_hit_transfers_out", []))),
+                    tuple(sorted(step.get("free_hit_transfers_in", []))),
                 )
                 for step in plan["gameweeks"]
             )
-            if signature in seen_plan_signatures:
+            if signature in seen_signatures:
                 break
-            seen_plan_signatures.add(signature)
-
-            plan["rank"] = round_idx + 1
-            has_immediate_transfers = bool(plan["gameweeks"][0]["transfers_in"])
-            plan["plan_code"] = chr(65 + round_idx) if has_immediate_transfers else "ROLL"
+            seen_signatures.add(signature)
+            plan["plan_code"] = chr(65 + round_idx)
             plan["gain_vs_hold"] = round(plan["expected_points"] - baseline_xp, 2)
-            plan["evaluation_gain_vs_hold"] = round(plan["evaluation_score"] - baseline_eval, 2)
+            plan["evaluation_gain_vs_hold"] = round(
+                plan["evaluation_score"] - baseline_eval, 2
+            )
             plans.append(plan)
 
-            # Record transfers to force diversity in next rounds
-            transfers_in_gw1 = tuple(sorted(plan["gameweeks"][0]["transfers_in"]))
-            if transfers_in_gw1:
-                excluded_transfer_sets.append(transfers_in_gw1)
-            elif not has_immediate_transfers:
+            first_in = tuple(sorted(plan["gameweeks"][0]["transfers_in"]))
+            if first_in:
+                excluded_transfer_sets.append(first_in)
+            else:
                 break
 
-        # Always expose the real roll baseline. If acting now does not clear a
-        # meaningful edge, make rolling the recommendation rather than presenting
-        # a marginal move as false precision.
         if hold_plan:
             hold_plan["plan_code"] = "ROLL"
             hold_plan["gain_vs_hold"] = 0.0
@@ -168,23 +243,31 @@ class OptimizationEngine:
             hold_signature = tuple(
                 (
                     step["gw"],
+                    step.get("chip"),
                     tuple(sorted(step["transfers_out"])),
                     tuple(sorted(step["transfers_in"])),
+                    (),
+                    (),
                 )
                 for step in hold_plan["gameweeks"]
             )
-            if hold_signature not in seen_plan_signatures:
+            if hold_signature not in seen_signatures:
                 plans.append(hold_plan)
 
-            action_plans = [plan for plan in plans if plan["gameweeks"][0]["transfers_in"]]
-            best_action_edge = max(
-                [plan.get("evaluation_gain_vs_hold", 0.0) for plan in action_plans],
+            action_plans = [
+                plan
+                for plan in plans
+                if plan["gameweeks"][0]["transfers_in"]
+                or plan["gameweeks"][0].get("chip")
+            ]
+            best_edge = max(
+                (plan.get("evaluation_gain_vs_hold", 0.0) for plan in action_plans),
                 default=0.0,
             )
-            if best_action_edge < float(self.rules.get("minimum_action_edge", 1.0)):
-                plans.sort(key=lambda plan: 0 if plan["plan_code"] == "ROLL" else 1)
+            if best_edge < float(self.rules["minimum_action_edge"]):
+                plans.sort(key=lambda item: 0 if item["plan_code"] == "ROLL" else 1)
 
-        for rank, plan in enumerate(plans, start=1):
+        for rank, plan in enumerate(plans[:top_n_plans], start=1):
             plan["rank"] = rank
 
         return {
@@ -193,8 +276,8 @@ class OptimizationEngine:
             "baseline_xp": round(baseline_xp, 2),
             "baseline_evaluation_score": round(baseline_eval, 2),
             "risk_profile": risk_profile,
-            "methodology": "distribution_aware_ev_v2",
-            "plans": plans[:top_n_plans]
+            "methodology": "hybrid_ewma_odds_chip_milp_v3",
+            "plans": plans[:top_n_plans],
         }
 
     def _solve_single_pass(
@@ -211,239 +294,489 @@ class OptimizationEngine:
         risk_profile: str,
         force_transfers_limit: Optional[int] = None,
         excluded_transfers: Optional[List[Tuple[int, ...]]] = None,
-        max_transfers_gw1: Optional[int] = None
+        max_transfers_gw1: Optional[int] = None,
+        allow_chips: bool = True,
+        forced_chip: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
+        if not target_gws:
+            return None
 
-        prob = pulp.LpProblem("FPL_Edge_Optimization", pulp.LpMaximize)
-        pids = [p.player_id for p in all_players]
-        initial_squad = set(sp.player_id for sp in manager_state.squad)
-        
-        # Decision Variables
-        squad = pulp.LpVariable.dicts("squad", ((p, g) for p in pids for g in target_gws), cat="Binary")
-        start = pulp.LpVariable.dicts("start", ((p, g) for p in pids for g in target_gws), cat="Binary")
-        cap = pulp.LpVariable.dicts("cap", ((p, g) for p in pids for g in target_gws), cat="Binary")
-        vcap = pulp.LpVariable.dicts("vcap", ((p, g) for p in pids for g in target_gws), cat="Binary")
+        problem = pulp.LpProblem("FPL_Edge_Optimization_v3", pulp.LpMaximize)
+        pids = [player.player_id for player in all_players]
+        players_by_id = {player.player_id: player for player in all_players}
+        initial_squad = {sp.player_id for sp in manager_state.squad}
+        if not initial_squad.issubset(set(pids)):
+            return None
 
-        # Transfer variables per GW
-        transfer_in = pulp.LpVariable.dicts("tin", ((p, g) for p in pids for g in target_gws), cat="Binary")
-        transfer_out = pulp.LpVariable.dicts("tout", ((p, g) for p in pids for g in target_gws), cat="Binary")
+        slots = range(4)
+        squad = pulp.LpVariable.dicts(
+            "squad", ((pid, gw) for pid in pids for gw in target_gws), cat="Binary"
+        )
+        active = pulp.LpVariable.dicts(
+            "active", ((pid, gw) for pid in pids for gw in target_gws), cat="Binary"
+        )
+        start = pulp.LpVariable.dicts(
+            "start", ((pid, gw) for pid in pids for gw in target_gws), cat="Binary"
+        )
+        captain = pulp.LpVariable.dicts(
+            "captain", ((pid, gw) for pid in pids for gw in target_gws), cat="Binary"
+        )
+        vice = pulp.LpVariable.dicts(
+            "vice", ((pid, gw) for pid in pids for gw in target_gws), cat="Binary"
+        )
+        bench = pulp.LpVariable.dicts(
+            "bench",
+            ((pid, gw, slot) for pid in pids for gw in target_gws for slot in slots),
+            cat="Binary",
+        )
+        transfer_in = pulp.LpVariable.dicts(
+            "tin", ((pid, gw) for pid in pids for gw in target_gws), cat="Binary"
+        )
+        transfer_out = pulp.LpVariable.dicts(
+            "tout", ((pid, gw) for pid in pids for gw in target_gws), cat="Binary"
+        )
+        free_hit_in = pulp.LpVariable.dicts(
+            "fhin", ((pid, gw) for pid in pids for gw in target_gws), cat="Binary"
+        )
+        free_hit_out = pulp.LpVariable.dicts(
+            "fhout", ((pid, gw) for pid in pids for gw in target_gws), cat="Binary"
+        )
 
-        # Free transfers and hits per GW
-        ft_vars = pulp.LpVariable.dicts("ft", target_gws, lowBound=1, upBound=5, cat="Integer")
-        hits_vars = pulp.LpVariable.dicts("hits", target_gws, lowBound=0, cat="Integer")
-        used_ft_vars = pulp.LpVariable.dicts("used_ft", target_gws, lowBound=0, upBound=5, cat="Integer")
-
-        # OBJECTIVE FUNCTION: Maximise expected points across horizon - hit penalty
-        obj_terms = []
-        for g_idx, g in enumerate(target_gws):
-            discount = 0.95 ** g_idx  # 5% future discount per GW
-            for p in pids:
-                proj = projections_by_gw.get(g, {}).get(p)
-                if proj:
-                    base_xp = self._risk_adjusted_points(proj, risk_profile)
-                    if p in mins_overrides:
-                        base_xp *= (mins_overrides[p] / max(1.0, proj.xmins))
-
-                    bench_weight = float(self.rules.get("bench_weight", 0.12))
-                    obj_terms.append(discount * base_xp * (1.0 - bench_weight) * start[(p, g)])
-                    obj_terms.append(discount * base_xp * bench_weight * squad[(p, g)])
-                    obj_terms.append(discount * base_xp * cap[(p, g)])
-
-                obj_terms.append(
-                    -discount * float(self.rules.get("free_transfer_value", 1.5)) * transfer_in[(p, g)]
-                )
-            
-            # Hit penalty: -4 pts per hit
-            obj_terms.append(-discount * 4.0 * hits_vars[g])
-
-        if target_gws:
-            obj_terms.append(float(self.rules.get("terminal_ft_value", 0.35)) * ft_vars[target_gws[-1]])
-
-        prob += pulp.lpSum(obj_terms)
-
-        pids_by_pos = {
-            pos: [p.player_id for p in all_players if p.position == pos]
-            for pos in [Position.GKP, Position.DEF, Position.MID, Position.FWD]
+        chip = {
+            name: pulp.LpVariable.dicts(name, target_gws, cat="Binary")
+            for name in self.CHIP_NAMES
         }
+        bb_bench = pulp.LpVariable.dicts(
+            "bb_bench",
+            ((pid, gw, slot) for pid in pids for gw in target_gws for slot in slots),
+            cat="Binary",
+        )
+        tc_captain = pulp.LpVariable.dicts(
+            "tc_captain", ((pid, gw) for pid in pids for gw in target_gws), cat="Binary"
+        )
 
-        # CONSTRAINTS
-        for g_idx, g in enumerate(target_gws):
-            # 1. Total Squad Size = 15
-            prob += pulp.lpSum([squad[(p, g)] for p in pids]) == 15
+        max_ft = int(self.rules["max_ft"])
+        ft = pulp.LpVariable.dicts(
+            "ft", target_gws, lowBound=1, upBound=max_ft, cat="Integer"
+        )
+        used_ft = pulp.LpVariable.dicts(
+            "used_ft", target_gws, lowBound=0, upBound=max_ft, cat="Integer"
+        )
+        paid_hits = pulp.LpVariable.dicts(
+            "paid_hits", target_gws, lowBound=0, upBound=15, cat="Integer"
+        )
+        over_free_transfer_limit = pulp.LpVariable.dicts(
+            "over_ft_limit", target_gws, cat="Binary"
+        )
+        rolled_ft = pulp.LpVariable.dicts(
+            "rolled_ft", target_gws, lowBound=1, upBound=max_ft, cat="Integer"
+        )
+        next_ft = pulp.LpVariable.dicts(
+            "next_ft", target_gws, lowBound=1, upBound=max_ft, cat="Integer"
+        )
+        ft_cap = pulp.LpVariable.dicts("ft_cap", target_gws, cat="Binary")
 
-            # 2. Position Limits in 15-man squad
-            prob += pulp.lpSum([squad[(p, g)] for p in pids_by_pos[Position.GKP]]) == 2
-            prob += pulp.lpSum([squad[(p, g)] for p in pids_by_pos[Position.DEF]]) == 5
-            prob += pulp.lpSum([squad[(p, g)] for p in pids_by_pos[Position.MID]]) == 5
-            prob += pulp.lpSum([squad[(p, g)] for p in pids_by_pos[Position.FWD]]) == 3
+        bench_weights = {
+            int(slot): float(weight)
+            for slot, weight in self.rules["bench_slot_weights"].items()
+        }
+        time_decay = float(self.rules["time_decay"])
+        objective_terms = []
+        for gw_idx, gw in enumerate(target_gws):
+            discount = time_decay**gw_idx
+            for pid in pids:
+                projection = projections_by_gw.get(gw, {}).get(pid)
+                if not projection:
+                    continue
+                adjusted_xp = self._risk_adjusted_points(projection, risk_profile)
+                if pid in mins_overrides:
+                    adjusted_xp *= float(mins_overrides[pid]) / max(1.0, projection.xmins)
+                objective_terms.append(discount * adjusted_xp * start[(pid, gw)])
+                objective_terms.append(discount * adjusted_xp * captain[(pid, gw)])
+                objective_terms.append(discount * adjusted_xp * tc_captain[(pid, gw)])
+                for slot in slots:
+                    weight = bench_weights[slot]
+                    objective_terms.append(
+                        discount * adjusted_xp * weight * bench[(pid, gw, slot)]
+                    )
+                    objective_terms.append(
+                        discount
+                        * adjusted_xp
+                        * (1.0 - weight)
+                        * bb_bench[(pid, gw, slot)]
+                    )
 
-            # 3. Max 3 players per Club
-            for team_id in range(1, 21):
-                club_pids = [p.player_id for p in all_players if p.team_id == team_id]
-                if club_pids:
-                    prob += pulp.lpSum([squad[(p, g)] for p in club_pids]) <= 3
+            objective_terms.append(
+                -discount * float(self.rules["hit_cost"]) * paid_hits[gw]
+            )
+            for chip_name in self.CHIP_NAMES:
+                objective_terms.append(
+                    -discount
+                    * float(self.rules["chip_reserve_values"].get(chip_name, 0.0))
+                    * chip[chip_name][gw]
+                )
 
-            # 4. Starting XI = 11, and start[p,g] <= squad[p,g]
-            prob += pulp.lpSum([start[(p, g)] for p in pids]) == 11
-            for p in pids:
-                prob += start[(p, g)] <= squad[(p, g)]
-                prob += cap[(p, g)] <= start[(p, g)]
-                prob += vcap[(p, g)] <= start[(p, g)]
-                prob += cap[(p, g)] + vcap[(p, g)] <= start[(p, g)]
-                prob += transfer_in[(p, g)] + transfer_out[(p, g)] <= 1
+        objective_terms.append(
+            float(self.rules["terminal_ft_value"]) * next_ft[target_gws[-1]]
+        )
+        problem += pulp.lpSum(objective_terms)
 
-            # 5. Formation Constraints (1 GKP, 3-5 DEF, 2-5 MID, 1-3 FWD)
-            prob += pulp.lpSum([start[(p, g)] for p in pids_by_pos[Position.GKP]]) == 1
-            prob += pulp.lpSum([start[(p, g)] for p in pids_by_pos[Position.DEF]]) >= 3
-            prob += pulp.lpSum([start[(p, g)] for p in pids_by_pos[Position.DEF]]) <= 5
-            prob += pulp.lpSum([start[(p, g)] for p in pids_by_pos[Position.MID]]) >= 2
-            prob += pulp.lpSum([start[(p, g)] for p in pids_by_pos[Position.MID]]) <= 5
-            prob += pulp.lpSum([start[(p, g)] for p in pids_by_pos[Position.FWD]]) >= 1
-            prob += pulp.lpSum([start[(p, g)] for p in pids_by_pos[Position.FWD]]) <= 3
+        pids_by_position = {
+            position: [p.player_id for p in all_players if p.position == position]
+            for position in Position
+        }
+        team_ids = sorted({player.team_id for player in all_players})
+        available_chips = manager_state.chips_available or {}
+        for chip_name in self.CHIP_NAMES:
+            availability = int(bool(available_chips.get(chip_name, 0)))
+            if not allow_chips:
+                availability = 0
+            problem += pulp.lpSum(chip[chip_name][gw] for gw in target_gws) <= availability
 
-            # 6. Exactly 1 Captain & 1 Vice Captain (Captains restricted to outfield players)
-            prob += pulp.lpSum([cap[(p, g)] for p in pids]) == 1
-            prob += pulp.lpSum([vcap[(p, g)] for p in pids]) == 1
-            for gkp_pid in pids_by_pos[Position.GKP]:
-                prob += cap[(gkp_pid, g)] == 0
-                prob += vcap[(gkp_pid, g)] == 0
+        if forced_chip:
+            first_gw = target_gws[0]
+            problem += chip[forced_chip][first_gw] == 1
 
-            # Captains must be credible starters. If data cannot support the armband,
-            # fail the solve instead of silently captaining a backup or goalkeeper.
+        for gw_idx, gw in enumerate(target_gws):
+            transfer_chip = chip["wildcard"][gw] + chip["free_hit"][gw]
+            problem += pulp.lpSum(chip[name][gw] for name in self.CHIP_NAMES) <= 1
+
+            previous = {
+                pid: (1 if pid in initial_squad else 0)
+                if gw_idx == 0
+                else squad[(pid, target_gws[gw_idx - 1])]
+                for pid in pids
+            }
+
+            num_in = pulp.lpSum(transfer_in[(pid, gw)] for pid in pids)
+            num_out = pulp.lpSum(transfer_out[(pid, gw)] for pid in pids)
+            num_fh_in = pulp.lpSum(free_hit_in[(pid, gw)] for pid in pids)
+            num_fh_out = pulp.lpSum(free_hit_out[(pid, gw)] for pid in pids)
+            problem += num_in == num_out
+            problem += num_fh_in == num_fh_out
+            problem += num_in <= int(self.rules["max_transfers_per_gw"]) + 10 * chip["wildcard"][gw]
+            problem += num_in <= 15 * (1 - chip["free_hit"][gw])
+            problem += num_fh_in <= 15 * chip["free_hit"][gw]
+
+            if force_transfers_limit is not None and gw_idx == 0:
+                problem += num_in == force_transfers_limit
+            if max_transfers_gw1 is not None and gw_idx == 0:
+                problem += num_in <= max_transfers_gw1
+
+            for pid in pids:
+                problem += (
+                    squad[(pid, gw)]
+                    == previous[pid] + transfer_in[(pid, gw)] - transfer_out[(pid, gw)]
+                )
+                problem += transfer_out[(pid, gw)] <= previous[pid]
+                problem += transfer_in[(pid, gw)] <= 1 - previous[pid]
+                problem += transfer_in[(pid, gw)] + transfer_out[(pid, gw)] <= 1
+
+                problem += (
+                    active[(pid, gw)]
+                    == squad[(pid, gw)] + free_hit_in[(pid, gw)] - free_hit_out[(pid, gw)]
+                )
+                problem += free_hit_in[(pid, gw)] <= chip["free_hit"][gw]
+                problem += free_hit_out[(pid, gw)] <= chip["free_hit"][gw]
+                problem += free_hit_in[(pid, gw)] <= 1 - squad[(pid, gw)]
+                problem += free_hit_out[(pid, gw)] <= squad[(pid, gw)]
+
+                problem += start[(pid, gw)] + pulp.lpSum(
+                    bench[(pid, gw, slot)] for slot in slots
+                ) == active[(pid, gw)]
+                problem += captain[(pid, gw)] <= start[(pid, gw)]
+                problem += vice[(pid, gw)] <= start[(pid, gw)]
+                problem += captain[(pid, gw)] + vice[(pid, gw)] <= start[(pid, gw)]
+
+                for slot in slots:
+                    problem += bb_bench[(pid, gw, slot)] <= bench[(pid, gw, slot)]
+                    problem += bb_bench[(pid, gw, slot)] <= chip["bench_boost"][gw]
+                    problem += (
+                        bb_bench[(pid, gw, slot)]
+                        >= bench[(pid, gw, slot)] + chip["bench_boost"][gw] - 1
+                    )
+                problem += tc_captain[(pid, gw)] <= captain[(pid, gw)]
+                problem += tc_captain[(pid, gw)] <= chip["triple_captain"][gw]
+                problem += (
+                    tc_captain[(pid, gw)]
+                    >= captain[(pid, gw)] + chip["triple_captain"][gw] - 1
+                )
+
+            for selection in (squad, active):
+                problem += pulp.lpSum(selection[(pid, gw)] for pid in pids) == 15
+                problem += pulp.lpSum(
+                    selection[(pid, gw)] for pid in pids_by_position[Position.GKP]
+                ) == 2
+                problem += pulp.lpSum(
+                    selection[(pid, gw)] for pid in pids_by_position[Position.DEF]
+                ) == 5
+                problem += pulp.lpSum(
+                    selection[(pid, gw)] for pid in pids_by_position[Position.MID]
+                ) == 5
+                problem += pulp.lpSum(
+                    selection[(pid, gw)] for pid in pids_by_position[Position.FWD]
+                ) == 3
+                for team_id in team_ids:
+                    club_pids = [
+                        pid for pid in pids if players_by_id[pid].team_id == team_id
+                    ]
+                    problem += pulp.lpSum(
+                        selection[(pid, gw)] for pid in club_pids
+                    ) <= int(self.rules["max_club"])
+
+            problem += pulp.lpSum(start[(pid, gw)] for pid in pids) == 11
+            problem += pulp.lpSum(captain[(pid, gw)] for pid in pids) == 1
+            problem += pulp.lpSum(vice[(pid, gw)] for pid in pids) == 1
+            problem += pulp.lpSum(
+                start[(pid, gw)] for pid in pids_by_position[Position.GKP]
+            ) == 1
+            problem += pulp.lpSum(
+                start[(pid, gw)] for pid in pids_by_position[Position.DEF]
+            ) >= 3
+            problem += pulp.lpSum(
+                start[(pid, gw)] for pid in pids_by_position[Position.DEF]
+            ) <= 5
+            problem += pulp.lpSum(
+                start[(pid, gw)] for pid in pids_by_position[Position.MID]
+            ) >= 2
+            problem += pulp.lpSum(
+                start[(pid, gw)] for pid in pids_by_position[Position.MID]
+            ) <= 5
+            problem += pulp.lpSum(
+                start[(pid, gw)] for pid in pids_by_position[Position.FWD]
+            ) >= 1
+            problem += pulp.lpSum(
+                start[(pid, gw)] for pid in pids_by_position[Position.FWD]
+            ) <= 3
+
+            for slot in slots:
+                problem += pulp.lpSum(bench[(pid, gw, slot)] for pid in pids) == 1
+            problem += pulp.lpSum(
+                bench[(pid, gw, 0)] for pid in pids_by_position[Position.GKP]
+            ) == 1
+            for pid in pids_by_position[Position.GKP]:
+                for slot in (1, 2, 3):
+                    problem += bench[(pid, gw, slot)] == 0
+            for pid in pids:
+                if players_by_id[pid].position != Position.GKP:
+                    problem += bench[(pid, gw, 0)] == 0
+
             for player in all_players:
-                proj = projections_by_gw.get(g, {}).get(player.player_id)
-                captain_eligible = bool(
+                pid = player.player_id
+                projection = projections_by_gw.get(gw, {}).get(pid)
+                can_transfer = bool(
+                    player.can_select
+                    and player.status not in {"i", "s", "u"}
+                    and projection
+                    and projection.fixtures_count > 0
+                    and projection.xmins >= float(self.rules["min_transfer_xmins"])
+                    and projection.start_probability
+                    >= float(self.rules["min_transfer_start_probability"])
+                )
+                if not can_transfer:
+                    problem += transfer_in[(pid, gw)] == 0
+                    problem += free_hit_in[(pid, gw)] == 0
+
+                can_captain = bool(
                     player.position != Position.GKP
                     and player.can_select
                     and player.status not in {"i", "s", "u"}
-                    and proj
-                    and proj.fixtures_count > 0
-                    and proj.xmins >= float(self.rules.get("min_captain_xmins", 45.0))
-                    and proj.start_probability >= float(self.rules.get("min_captain_start_probability", 0.55))
+                    and projection
+                    and projection.fixtures_count > 0
+                    and projection.xmins >= float(self.rules["min_captain_xmins"])
+                    and projection.start_probability
+                    >= float(self.rules["min_captain_start_probability"])
                 )
-                if not captain_eligible:
-                    prob += cap[(player.player_id, g)] == 0
-                    prob += vcap[(player.player_id, g)] == 0
+                if not can_captain:
+                    problem += captain[(pid, gw)] == 0
+                    problem += vice[(pid, gw)] == 0
 
-            # 7. Transfers & Squad Transition
-            prev_squad_vars = [1 if p in initial_squad else 0 for p in pids] if g_idx == 0 else [squad[(p, target_gws[g_idx-1])] for p in pids]
+            for locked_pid in locked_pids:
+                if locked_pid in pids:
+                    problem += squad[(locked_pid, gw)] == 1
+            for banned_pid in banned_pids:
+                if banned_pid in pids:
+                    problem += squad[(banned_pid, gw)] == 0
+                    problem += active[(banned_pid, gw)] == 0
 
-            for i, p in enumerate(pids):
-                prob += squad[(p, g)] == prev_squad_vars[i] + transfer_in[(p, g)] - transfer_out[(p, g)]
-
-            # 8. Free Transfer & Hit Calculations
-            num_transfers = pulp.lpSum([transfer_in[(p, g)] for p in pids])
-            prob += num_transfers <= int(self.rules.get("max_transfers_per_gw", 5))
-            if force_transfers_limit is not None and g_idx == 0:
-                prob += num_transfers == force_transfers_limit
-            if max_transfers_gw1 is not None and g_idx == 0:
-                prob += num_transfers <= max_transfers_gw1
-
-            for player in all_players:
-                proj = projections_by_gw.get(g, {}).get(player.player_id)
-                transfer_eligible = bool(
-                    player.can_select
-                    and player.status not in {"i", "s", "u"}
-                    and proj
-                    and proj.fixtures_count > 0
-                    and proj.xmins >= float(self.rules.get("min_transfer_xmins", 20.0))
-                    and proj.start_probability >= float(self.rules.get("min_transfer_start_probability", 0.20))
+            if gw_idx == 0:
+                problem += ft[gw] == max(
+                    1, min(max_ft, int(manager_state.free_transfers))
                 )
-                if not transfer_eligible:
-                    prob += transfer_in[(player.player_id, g)] == 0
-
-            if g_idx == 0:
-                prob += ft_vars[g] == manager_state.free_transfers
             else:
-                prev_gw = target_gws[g_idx - 1]
-                prob += ft_vars[g] <= ft_vars[prev_gw] - used_ft_vars[prev_gw] + 1
+                problem += ft[gw] == next_ft[target_gws[gw_idx - 1]]
 
-            prob += used_ft_vars[g] <= ft_vars[g]
-            prob += used_ft_vars[g] <= num_transfers
-            prob += hits_vars[g] == num_transfers - used_ft_vars[g]
+            # Hits are exactly transfers above available FTs. Wildcard and Free Hit
+            # consume no FT and incur no hits.
+            big_m = 15
+            problem += paid_hits[gw] >= num_in - ft[gw] - big_m * transfer_chip
+            problem += paid_hits[gw] <= (
+                num_in - ft[gw]
+                + big_m * (1 - over_free_transfer_limit[gw])
+                + big_m * transfer_chip
+            )
+            problem += paid_hits[gw] <= big_m * over_free_transfer_limit[gw]
+            problem += over_free_transfer_limit[gw] <= 1 - transfer_chip
+            problem += num_in - ft[gw] <= big_m * (
+                over_free_transfer_limit[gw] + transfer_chip
+            )
+            problem += num_in - ft[gw] >= (
+                1
+                - big_m * (1 - over_free_transfer_limit[gw])
+                - big_m * transfer_chip
+            )
+            problem += used_ft[gw] <= ft[gw]
+            problem += used_ft[gw] <= num_in
+            problem += used_ft[gw] <= big_m * (1 - transfer_chip)
+            problem += used_ft[gw] - (num_in - paid_hits[gw]) <= big_m * transfer_chip
+            problem += (num_in - paid_hits[gw]) - used_ft[gw] <= big_m * transfer_chip
 
-            # 9. Bank & Budget Constraint: cumulative bank after transfers in GW g must be >= 0.0
-            cum_gained = pulp.lpSum([sell_prices[p] * transfer_out[(p, target_gws[g_k])] for p in pids for g_k in range(g_idx + 1)])
-            cum_spent = pulp.lpSum([buy_prices[p] * transfer_in[(p, target_gws[g_k])] for p in pids for g_k in range(g_idx + 1)])
-            prob += manager_state.bank + cum_gained - cum_spent >= 0.0
+            # Exact min(5, entering FT - used FT + 1), then preserve saved FTs
+            # during Wildcard and Free Hit weeks as required by the game rules.
+            raw_roll = ft[gw] - used_ft[gw] + 1
+            problem += raw_roll <= max_ft + ft_cap[gw]
+            problem += raw_roll >= (max_ft + 1) * ft_cap[gw]
+            problem += rolled_ft[gw] == raw_roll - ft_cap[gw]
+            problem += next_ft[gw] - rolled_ft[gw] <= big_m * transfer_chip
+            problem += rolled_ft[gw] - next_ft[gw] <= big_m * transfer_chip
+            problem += next_ft[gw] - ft[gw] <= big_m * (1 - transfer_chip)
+            problem += ft[gw] - next_ft[gw] <= big_m * (1 - transfer_chip)
 
-            # Locked / Banned constraints
-            for lp in locked_pids:
-                if lp in pids:
-                    prob += squad[(lp, g)] == 1
-            for bp in banned_pids:
-                if bp in pids:
-                    prob += squad[(bp, g)] == 0
+            cumulative_income = pulp.lpSum(
+                sell_prices[pid] * transfer_out[(pid, prior_gw)]
+                for pid in pids
+                for prior_gw in target_gws[: gw_idx + 1]
+            )
+            cumulative_spend = pulp.lpSum(
+                buy_prices[pid] * transfer_in[(pid, prior_gw)]
+                for pid in pids
+                for prior_gw in target_gws[: gw_idx + 1]
+            )
+            persistent_bank = manager_state.bank + cumulative_income - cumulative_spend
+            problem += persistent_bank >= 0
+            problem += pulp.lpSum(
+                buy_prices[pid] * free_hit_in[(pid, gw)] for pid in pids
+            ) <= persistent_bank + pulp.lpSum(
+                sell_prices[pid] * free_hit_out[(pid, gw)] for pid in pids
+            )
 
-        # Avoid short-horizon churn such as selling a player and buying them back
-        # two weeks later. A player may cross the squad boundary only once.
-        for p in pids:
-            prob += pulp.lpSum(
-                transfer_in[(p, g)] + transfer_out[(p, g)] for g in target_gws
+        for pid in pids:
+            problem += pulp.lpSum(
+                transfer_in[(pid, gw)] + transfer_out[(pid, gw)] for gw in target_gws
             ) <= 1
 
-        # Exclude specific transfer in combinations for diversity
         if excluded_transfers:
-            g1 = target_gws[0]
-            for ex_set in excluded_transfers:
-                prob += pulp.lpSum([transfer_in[(p, g1)] for p in ex_set]) <= len(ex_set) - 1
+            first_gw = target_gws[0]
+            for excluded in excluded_transfers:
+                if excluded:
+                    problem += pulp.lpSum(
+                        transfer_in[(pid, first_gw)]
+                        for pid in excluded
+                        if pid in pids
+                    ) <= len(excluded) - 1
 
-        # Solve MILP problem using PuLP CBC
-        solver = pulp.PULP_CBC_CMD(msg=False)
-        prob.solve(solver)
-
-        if pulp.LpStatus[prob.status] != "Optimal":
+        problem.solve(pulp.PULP_CBC_CMD(msg=False))
+        if pulp.LpStatus[problem.status] != "Optimal":
             return None
 
-        # Parse Solution
-        evaluation_score = float(pulp.value(prob.objective))
-        gw_plans = []
+        evaluation_score = float(pulp.value(problem.objective) or 0.0)
+        gameweeks: List[Dict[str, Any]] = []
+        current_bank = float(manager_state.bank)
         total_hits = 0
         raw_expected_points = 0.0
 
-        current_bank = manager_state.bank
-
-        for g_idx, g in enumerate(target_gws):
-            tin_list = [p for p in pids if pulp.value(transfer_in[(p, g)]) > 0.5]
-            tout_list = [p for p in pids if pulp.value(transfer_out[(p, g)]) > 0.5]
-            starter_list = [p for p in pids if pulp.value(start[(p, g)]) > 0.5]
-            bench_list = [p for p in pids if pulp.value(squad[(p, g)]) > 0.5 and pulp.value(start[(p, g)]) <= 0.5]
-            captain_pid = next((p for p in pids if pulp.value(cap[(p, g)]) > 0.5), starter_list[0] if starter_list else 0)
-            vcaptain_pid = next((p for p in pids if pulp.value(vcap[(p, g)]) > 0.5), starter_list[1] if len(starter_list)>1 else 0)
-
-            hits_incurred = int(pulp.value(hits_vars[g]))
-            total_hits += hits_incurred
-
-            discount = 0.95 ** g_idx
-            bench_weight = float(self.rules.get("bench_weight", 0.12))
-            raw_expected_points += discount * sum(
-                projections_by_gw[g][p].mean_xp for p in starter_list if p in projections_by_gw[g]
+        for gw_idx, gw in enumerate(target_gws):
+            discount = time_decay**gw_idx
+            tin = [pid for pid in pids if (pulp.value(transfer_in[(pid, gw)]) or 0) > 0.5]
+            tout = [pid for pid in pids if (pulp.value(transfer_out[(pid, gw)]) or 0) > 0.5]
+            fh_in = [pid for pid in pids if (pulp.value(free_hit_in[(pid, gw)]) or 0) > 0.5]
+            fh_out = [pid for pid in pids if (pulp.value(free_hit_out[(pid, gw)]) or 0) > 0.5]
+            persistent_squad = [pid for pid in pids if (pulp.value(squad[(pid, gw)]) or 0) > 0.5]
+            active_squad = [pid for pid in pids if (pulp.value(active[(pid, gw)]) or 0) > 0.5]
+            starters = [pid for pid in pids if (pulp.value(start[(pid, gw)]) or 0) > 0.5]
+            ordered_bench = [
+                next(
+                    pid
+                    for pid in pids
+                    if (pulp.value(bench[(pid, gw, slot)]) or 0) > 0.5
+                )
+                for slot in slots
+            ]
+            captain_pid = next(
+                pid for pid in pids if (pulp.value(captain[(pid, gw)]) or 0) > 0.5
             )
-            raw_expected_points += discount * sum(
-                bench_weight * projections_by_gw[g][p].mean_xp for p in bench_list if p in projections_by_gw[g]
+            vice_pid = next(
+                pid for pid in pids if (pulp.value(vice[(pid, gw)]) or 0) > 0.5
             )
-            if captain_pid in projections_by_gw[g]:
-                raw_expected_points += discount * projections_by_gw[g][captain_pid].mean_xp
-            raw_expected_points -= discount * 4.0 * hits_incurred
+            selected_chip = next(
+                (
+                    name
+                    for name in self.CHIP_NAMES
+                    if (pulp.value(chip[name][gw]) or 0) > 0.5
+                ),
+                None,
+            )
+            hits = int(round(pulp.value(paid_hits[gw]) or 0))
+            total_hits += hits
+            current_bank = round(
+                current_bank
+                + sum(sell_prices[pid] for pid in tout)
+                - sum(buy_prices[pid] for pid in tin),
+                2,
+            )
 
-            # Bank calculation
-            spent = sum(buy_prices[p] for p in tin_list)
-            gained = sum(sell_prices[p] for p in tout_list)
-            current_bank = round(current_bank + gained - spent, 2)
-            ft_rem = int(pulp.value(ft_vars[g]))
+            gw_points = sum(
+                projections_by_gw.get(gw, {}).get(pid).mean_xp
+                for pid in starters
+                if projections_by_gw.get(gw, {}).get(pid)
+            )
+            chip_points_added = 0.0
+            for slot, pid in enumerate(ordered_bench):
+                projection = projections_by_gw.get(gw, {}).get(pid)
+                if projection:
+                    weight = 1.0 if selected_chip == "bench_boost" else bench_weights[slot]
+                    gw_points += weight * projection.mean_xp
+                    if selected_chip == "bench_boost":
+                        chip_points_added += (
+                            1.0 - bench_weights[slot]
+                        ) * projection.mean_xp
+            captain_projection = projections_by_gw.get(gw, {}).get(captain_pid)
+            if captain_projection:
+                gw_points += captain_projection.mean_xp
+                if selected_chip == "triple_captain":
+                    gw_points += captain_projection.mean_xp
+                    chip_points_added += captain_projection.mean_xp
+            gw_points -= float(self.rules["hit_cost"]) * hits
+            raw_expected_points += discount * gw_points
 
-            gw_plans.append({
-                "gw": g,
-                "transfers_out": tout_list,
-                "transfers_in": tin_list,
-                "starters": starter_list,
-                "bench": bench_list,
-                "captain": captain_pid,
-                "vice_captain": vcaptain_pid,
-                "hits": hits_incurred,
-                "bank": current_bank,
-                "free_transfers": ft_rem
-            })
+            gameweeks.append(
+                {
+                    "gw": gw,
+                    "chip": selected_chip,
+                    "transfers_out": tout,
+                    "transfers_in": tin,
+                    "free_hit_transfers_out": fh_out,
+                    "free_hit_transfers_in": fh_in,
+                    "persistent_squad": persistent_squad,
+                    "active_squad": active_squad,
+                    "starters": starters,
+                    "bench": ordered_bench,
+                    "bench_order": {
+                        "reserve_goalkeeper": ordered_bench[0],
+                        "first_sub": ordered_bench[1],
+                        "second_sub": ordered_bench[2],
+                        "third_sub": ordered_bench[3],
+                    },
+                    "captain": captain_pid,
+                    "vice_captain": vice_pid,
+                    "hits": hits,
+                    "bank": current_bank,
+                    "free_transfers": int(round(pulp.value(ft[gw]) or 1)),
+                    "next_free_transfers": int(round(pulp.value(next_ft[gw]) or 1)),
+                    "expected_points": round(gw_points, 2),
+                    "chip_points_added": round(chip_points_added, 2),
+                }
+            )
 
         return {
             "expected_points": round(raw_expected_points, 2),
@@ -451,5 +784,5 @@ class OptimizationEngine:
             "hits": total_hits,
             "final_bank": current_bank,
             "robustness": 0.88 if total_hits == 0 else 0.76,
-            "gameweeks": gw_plans
+            "gameweeks": gameweeks,
         }

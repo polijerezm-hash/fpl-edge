@@ -136,6 +136,12 @@ class DataRepository:
                 return p
         return None
 
+    def enrich_recent_histories(self, player_ids: List[int]) -> List[Player]:
+        """Attach cached recent-match histories to a bounded projection pool."""
+        players = self.get_players()
+        self._players_cache = self.provider.enrich_player_histories(players, player_ids)
+        return self._players_cache
+
     def get_teams(self) -> List[Team]:
         if not self._teams_cache:
             self.refresh_snapshots()

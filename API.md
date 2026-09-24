@@ -20,12 +20,12 @@ The REST API is implemented in FastAPI and exposes clean, typed JSON contracts.
 ### 4. Planning & Optimization
 - `POST /api/optimise`: Runs MILP solver.
   - Body: `{ manager_id, horizon: 1|3|5, risk_profile: "safe"|"balanced"|"aggressive", locked_players, banned_players, custom_overrides }`
-  - Returns: `{ baseline_xp, plans: [ Top 5 Feasible Plans with Transfer Sequence, Bank, FT state, xP Gain vs HOLD ] }`
+  - Returns: `{ baseline_xp, methodology, plans: [ Top 5 Feasible Plans with transfer sequence, chip, ordered bench, persistent/active squad, bank, exact FT state, xP gain vs HOLD ] }`
 
 ### 5. Strategy & Captaincy
 - `POST /api/captaincy`: Returns Shield, Diamond, and Sword captain candidates with floor/ceiling distribution statistics.
-- `POST /api/chips/analyse`: Evaluates candidate gameweeks for Wildcard, Free Hit, Bench Boost, and Triple Captain.
+- `POST /api/chips/analyse`: Runs the joint multi-period solver and reports whether Wildcard, Free Hit, Bench Boost, or Triple Captain clears its future-value threshold.
 
 ### 6. AI Assistant
-- `POST /api/assistant`: Grounded Q&A engine using deterministic `DECISION_CONTEXT`.
+- `POST /api/assistant`: Grounded Q&A engine using deterministic `DECISION_CONTEXT`, with an optional OpenAI Responses API renderer.
 - `GET /api/evaluation`: Model performance, MAE by position, start accuracy, and captain efficiency metrics.

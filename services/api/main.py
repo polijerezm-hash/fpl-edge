@@ -20,11 +20,12 @@ from core.optimizer.solver import OptimizationEngine
 from core.strategy.engine import StrategyEngine
 from core.explanation.engine import GroundedExplainerEngine
 from core.evaluation.engine import EvaluationEngine
+from core.integrations.ai_connectors import ExternalDataConnector
 
 app = FastAPI(
     title="FPL Edge API",
     description="Deterministic Decision-Support API for Fantasy Premier League",
-    version="1.0.0"
+    version="3.0.0"
 )
 
 # Enable CORS for frontend
@@ -54,6 +55,32 @@ optimizer_engine = OptimizationEngine()
 strategy_engine = StrategyEngine()
 explainer_engine = GroundedExplainerEngine()
 evaluation_engine = EvaluationEngine()
+external_data_connector = ExternalDataConnector()
+
+
+def _history_candidate_ids(players: List[Player], manager_state: Optional[ManagerState] = None) -> List[int]:
+    """Bound official history calls to the realistic solver pool plus enablers."""
+    selected = {sp.player_id for sp in manager_state.squad} if manager_state else set()
+    limits = {"GKP": 10, "DEF": 35, "MID": 45, "FWD": 25}
+    for position, limit in limits.items():
+        eligible = [
+            p for p in players
+            if p.position.value == position and p.can_select and p.status not in {"i", "s", "u"}
+        ]
+        eligible.sort(
+            key=lambda p: (p.ep_next * 3.0 + p.form + 0.025 * p.total_points + 0.02 * p.selected_by_pct),
+            reverse=True,
+        )
+        selected.update(p.player_id for p in eligible[:limit])
+        selected.update(p.player_id for p in sorted(eligible, key=lambda p: p.current_price)[:3])
+    return sorted(selected)
+
+
+def _ensure_projection_histories(repo: DataRepository, manager_state: Optional[ManagerState] = None) -> None:
+    if repo.data_mode != "live":
+        return
+    players = repo.get_players()
+    repo.enrich_recent_histories(_history_candidate_ids(players, manager_state))
 
 # Global Structured Exception Handlers
 @app.exception_handler(LiveDataUnavailableError)
@@ -128,6 +155,7 @@ def _get_all_projections_for_gw(gw: int, data_mode: str = "live") -> Dict[int, P
     as_of = repo.get_as_of_timestamp()
     snap_id = repo.get_snapshot_id()
     projections = {}
+    odds_snapshot = external_data_connector.fetch_epl_probabilities() if external_data_connector.configured else None
 
     for p in players:
         p_team = teams_dict.get(p.team_id)
@@ -135,6 +163,25 @@ def _get_all_projections_for_gw(gw: int, data_mode: str = "live") -> Dict[int, P
             continue
         p_fixtures = team_fixtures_map.get(p.team_id, [])
         p_rec_mins = reconciled_mins_by_team.get(p.team_id, {}).get(p.player_id)
+        external_by_fixture: Dict[int, Dict[str, float]] = {}
+        if odds_snapshot:
+            for opponent, fixture, _ in p_fixtures:
+                inputs = external_data_connector.inputs_for_player(
+                    player_name=f"{p.first_name} {p.second_name}".strip() or p.web_name,
+                    team_name=p_team.name,
+                    opponent_name=opponent.name,
+                    snapshot=odds_snapshot,
+                )
+                if not any(key in inputs for key in ("goal_probability", "assist_probability")):
+                    inputs.update(
+                        external_data_connector.inputs_for_player(
+                            player_name=p.web_name,
+                            team_name=p_team.name,
+                            opponent_name=opponent.name,
+                            snapshot=odds_snapshot,
+                        )
+                    )
+                external_by_fixture[fixture.fixture_id] = inputs
         
         proj = projection_engine.calculate_gameweek_projection(
             player=p,
@@ -142,6 +189,8 @@ def _get_all_projections_for_gw(gw: int, data_mode: str = "live") -> Dict[int, P
             fixtures_info=p_fixtures,
             gameweek=gw,
             reconciled_mins=p_rec_mins,
+            external_inputs_by_fixture=external_by_fixture,
+            use_official_ep_next=(gw == repo.get_current_gameweek()),
             as_of_timestamp=as_of,
             snapshot_id=snap_id
         )
@@ -156,7 +205,7 @@ def read_api_info():
     snap = repo.current_snapshot
     return {
         "name": "FPL Edge Decision-Support API",
-        "version": "1.0.0",
+        "version": "3.0.0",
         "status": "operational",
         "active_snapshot": snap.model_dump()
     }
@@ -211,6 +260,7 @@ def get_players(
 @app.get("/api/players/{player_id}")
 def get_player_detail(player_id: int, data_mode: str = Query("live")):
     repo = get_repo(data_mode)
+    _ensure_projection_histories(repo)
     player = repo.get_player_by_id(player_id)
     if not player:
         raise HTTPException(status_code=404, detail="Player not found in active snapshot")
@@ -240,6 +290,7 @@ def get_manager_team(manager_id: int, data_mode: str = Query("live")):
 @app.get("/api/projections")
 def get_projections(gw: Optional[int] = Query(None), data_mode: str = Query("live")):
     repo = get_repo(data_mode)
+    _ensure_projection_histories(repo)
     target_gw = gw or repo.get_current_gameweek()
     projs = _get_all_projections_for_gw(target_gw, data_mode=data_mode)
     return {
@@ -266,11 +317,18 @@ def run_optimization(req: OptimizeRequest):
             }
         )
 
+    _ensure_projection_histories(repo, manager_state)
     all_players = repo.get_players()
     teams = repo.get_teams()
     current_gw = repo.get_current_gameweek()
 
-    target_gws = list(range(current_gw, current_gw + req.horizon))
+    target_gws = sorted({
+        fixture.gameweek
+        for fixture in repo.get_fixtures()
+        if fixture.gameweek >= current_gw
+    })[: req.horizon]
+    if not target_gws:
+        target_gws = [current_gw]
     projections_by_gw = {}
     for g in target_gws:
         projections_by_gw[g] = _get_all_projections_for_gw(g, data_mode=req.data_mode)
@@ -280,7 +338,7 @@ def run_optimization(req: OptimizeRequest):
         all_players=all_players,
         teams=teams,
         projections_by_gw=projections_by_gw,
-        horizon=req.horizon,
+        horizon=len(target_gws),
         risk_profile=req.risk_profile,
         locked_player_ids=req.locked_players,
         banned_player_ids=req.banned_players,
@@ -314,7 +372,7 @@ def run_optimization(req: OptimizeRequest):
     opt_result["plans"] = validated_plans
     opt_result["snapshot_id"] = repo.get_snapshot_id()
     opt_result["as_of_timestamp"] = repo.get_as_of_timestamp()
-    opt_result["model_version"] = "2.0.0"
+    opt_result["model_version"] = "3.0.0"
     _decision_cache[(req.data_mode.lower(), req.manager_id)] = opt_result
     return opt_result
 
@@ -322,6 +380,7 @@ def run_optimization(req: OptimizeRequest):
 def get_captaincy_picks(manager_id: int = Query(1), data_mode: str = Query("live")):
     repo = get_repo(data_mode)
     manager_state = repo.get_manager_state(manager_id)
+    _ensure_projection_histories(repo, manager_state)
     current_gw = repo.get_current_gameweek()
     projections = _get_all_projections_for_gw(current_gw, data_mode=data_mode)
     players_dict = {p.player_id: p for p in repo.get_players()}
@@ -334,7 +393,7 @@ def get_captaincy_picks(manager_id: int = Query(1), data_mode: str = Query("live
     )
     result["gameweek"] = current_gw
     result["snapshot_id"] = repo.get_snapshot_id()
-    result["model_version"] = "2.0.0"
+    result["model_version"] = "3.0.0"
     _captaincy_cache[(data_mode.lower(), manager_id)] = result
     return result
 
@@ -355,6 +414,7 @@ def get_mini_league_analysis(
 ):
     repo = get_repo(data_mode)
     analysis = repo.get_mini_league_analysis(manager_id, league_id)
+    _ensure_projection_histories(repo)
     projections = _get_all_projections_for_gw(repo.get_current_gameweek(), data_mode=data_mode)
 
     for exposure in analysis.get("exposures", []):
@@ -390,22 +450,43 @@ def get_mini_league_analysis(
 def analyze_chips(manager_id: int = Query(1), data_mode: str = Query("live")):
     repo = get_repo(data_mode)
     manager_state = repo.get_manager_state(manager_id)
+    _ensure_projection_histories(repo, manager_state)
     current_gw = repo.get_current_gameweek()
     
+    target_gws = sorted({
+        fixture.gameweek
+        for fixture in repo.get_fixtures()
+        if fixture.gameweek >= current_gw
+    })[:5]
+    if not target_gws:
+        target_gws = [current_gw]
     projections_by_gw = {}
-    for g in range(current_gw, current_gw + 5):
+    for g in target_gws:
         projections_by_gw[g] = _get_all_projections_for_gw(g, data_mode=data_mode)
+
+    optimization_result = optimizer_engine.optimize_squad(
+        manager_state=manager_state,
+        all_players=repo.get_players(),
+        teams=repo.get_teams(),
+        projections_by_gw=projections_by_gw,
+        horizon=len(target_gws),
+        top_n_plans=1,
+        free_transfers_override=manager_state.free_transfers,
+        allow_chips=True,
+    )
 
     return strategy_engine.analyze_chips(
         manager_state=manager_state,
         projections_by_gw=projections_by_gw,
-        fixtures_by_gw={}
+        fixtures_by_gw={},
+        optimization_result=optimization_result,
     )
 
 @app.post("/api/assistant")
 def ask_assistant(req: AssistantRequest):
     repo = get_repo(req.data_mode)
     manager_state = repo.get_manager_state(req.manager_id)
+    _ensure_projection_histories(repo, manager_state)
     all_players = repo.get_players()
     current_gw = repo.get_current_gameweek()
 
@@ -424,7 +505,7 @@ def ask_assistant(req: AssistantRequest):
         )
         opt_result["snapshot_id"] = repo.get_snapshot_id()
         opt_result["as_of_timestamp"] = repo.get_as_of_timestamp()
-        opt_result["model_version"] = "2.0.0"
+        opt_result["model_version"] = "3.0.0"
         _decision_cache[cache_key] = opt_result
 
     plans = opt_result.get("plans", [])
@@ -462,7 +543,7 @@ def ask_assistant(req: AssistantRequest):
         alternative_plans=alt_plans,
         player_lookup=player_lookup,
         as_of_timestamp=repo.get_as_of_timestamp(),
-        model_version="2.0.0",
+        model_version="3.0.0",
         captaincy=captaincy,
     )
 

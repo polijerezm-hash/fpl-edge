@@ -17,6 +17,45 @@ from data.demo.seed_data import (
 
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 (FPL-Edge/1.0)"
 
+
+def calculate_selling_price(purchase_price: float, current_price: float) -> float:
+    """Apply FPL's half-profit rule exactly in integer £0.1m units."""
+    purchase = int(round(purchase_price * 10))
+    current = int(round(current_price * 10))
+    if current <= purchase:
+        return current / 10.0
+    return (purchase + (current - purchase) // 2) / 10.0
+
+
+def reconstruct_free_transfers(
+    event_history: List[Dict[str, Any]],
+    chips: List[Dict[str, Any]],
+    through_event: int,
+    max_free_transfers: int = 5,
+) -> int:
+    """Replay public manager history into the exact next-deadline FT balance."""
+    transfer_chip_events = {
+        int(row.get("event", 0) or 0)
+        for row in chips
+        if str(row.get("name", "")).lower() in {"wildcard", "freehit", "free_hit"}
+    }
+    free_transfers = 1
+    for row in sorted(event_history, key=lambda item: int(item.get("event", 0) or 0)):
+        event = int(row.get("event", 0) or 0)
+        # The initial squad is not a transfer decision. GW2 starts with one FT.
+        if event < 2 or event > int(through_event):
+            continue
+        if event in transfer_chip_events:
+            continue
+        transfers = max(0, int(row.get("event_transfers", 0) or 0))
+        paid_transfers = max(0, int(row.get("event_transfers_cost", 0) or 0) // 4)
+        used = max(0, min(free_transfers, transfers - paid_transfers))
+        free_transfers = min(
+            max_free_transfers,
+            max(1, free_transfers - used + 1),
+        )
+    return free_transfers
+
 class DataProvider(ABC):
     data_mode: str = "base"
 
@@ -55,6 +94,9 @@ class DataProvider(ABC):
         players: List[Player]
     ) -> Dict[str, Any]:
         raise LiveDataUnavailableError("Mini-league analysis is not available for this provider")
+
+    def enrich_player_histories(self, players: List[Player], player_ids: List[int]) -> List[Player]:
+        return players
 
 
 class DemoProvider(DataProvider):
@@ -140,6 +182,7 @@ class FplOfficialProvider(DataProvider):
         self.timeout = timeout
         self._bootstrap_cache: Optional[Dict[str, Any]] = None
         self._last_fetch: float = 0
+        self._history_cache: Dict[int, tuple] = {}
         self._status = DataStatus(
             provider_name="Official FPL API",
             connected=False,
@@ -227,8 +270,11 @@ class FplOfficialProvider(DataProvider):
                 except (ValueError, TypeError):
                     return default
 
+            player_id = el["id"]
+            cached_history = self._history_cache.get(player_id)
+            recent_history = cached_history[1] if cached_history and time.time() - cached_history[0] < 1800 else []
             players.append(Player(
-                player_id=el["id"],
+                player_id=player_id,
                 first_name=el.get("first_name", ""),
                 second_name=el.get("second_name", ""),
                 web_name=el.get("web_name", "Unknown"),
@@ -236,6 +282,14 @@ class FplOfficialProvider(DataProvider):
                 position=pos_map.get(el.get("element_type", 3), Position.MID),
                 current_price=round(safe_float(el.get("now_cost", 50)) / 10.0, 1),
                 selected_by_pct=sel_pct,
+                season_start_price=round(
+                    (
+                        safe_float(el.get("now_cost", 50))
+                        - safe_float(el.get("cost_change_start", 0))
+                    )
+                    / 10.0,
+                    1,
+                ),
                 can_select=bool(el.get("can_select", True)),
                 status=el.get("status", "a"),
                 chance_of_playing_next_round=el.get("chance_of_playing_next_round"),
@@ -258,11 +312,51 @@ class FplOfficialProvider(DataProvider):
                 influence=safe_float(el.get("influence")),
                 creativity=safe_float(el.get("creativity")),
                 threat=safe_float(el.get("threat")),
-                ict_index=safe_float(el.get("ict_index"))
+                ict_index=safe_float(el.get("ict_index")),
+                recent_history=recent_history,
             ))
         return players
 
-    def _get_json(self, path: str) -> Dict[str, Any]:
+    def enrich_player_histories(self, players: List[Player], player_ids: List[int]) -> List[Player]:
+        """Fetch bounded, cached element histories for the projection candidate pool."""
+        requested = list(dict.fromkeys(int(pid) for pid in player_ids))[:130]
+        now = time.time()
+        missing = [
+            pid for pid in requested
+            if pid not in self._history_cache or now - self._history_cache[pid][0] >= 1800
+        ]
+
+        def fetch(pid: int):
+            payload = self._get_json(f"/element-summary/{pid}/")
+            history = payload.get("history", [])
+            # Eight rounds is enough for a 4-6 GW half-life without making the
+            # snapshot unnecessarily large.
+            return pid, history[-10:]
+
+        if missing:
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures = {executor.submit(fetch, pid): pid for pid in missing}
+                for future in as_completed(futures):
+                    pid = futures[future]
+                    try:
+                        _, history = future.result()
+                        self._history_cache[pid] = (now, history)
+                    except Exception:
+                        # History is an enhancement, never a reason to make the
+                        # live official snapshot unavailable.
+                        self._history_cache.setdefault(pid, (now, []))
+
+        enriched = []
+        requested_set = set(requested)
+        for player in players:
+            if player.player_id in requested_set:
+                cached = self._history_cache.get(player.player_id)
+                enriched.append(player.model_copy(update={"recent_history": cached[1] if cached else []}))
+            else:
+                enriched.append(player)
+        return enriched
+
+    def _get_json(self, path: str) -> Any:
         try:
             response = requests.get(
                 f"{self.BASE_URL}{path}",
@@ -511,12 +605,61 @@ class FplOfficialProvider(DataProvider):
         overall_rank = entry_history.get("overall_rank", 100000)
         overall_points = entry_history.get("total_points", entry_data.get("summary_overall_points", 0))
 
-        # Free transfers heuristic
-        event_transfers = entry_history.get("event_transfers", 0)
-        free_transfers = max(1, 1 - event_transfers)
+        # Reconstructed below from the full event history. The public API does
+        # not expose the manager's current free-transfer balance directly.
+        free_transfers = 1
 
         # Map player elements
         players_dict = {p.player_id: p for p in self.get_players()}
+        # The public picks endpoint normally omits acquisition values. Rebuild
+        # purchase prices for transferred-in players from the manager's public
+        # transfer ledger. Players retained from the original squad fall back to
+        # current price because their historic purchase price is not public.
+        acquisition_prices: Dict[int, float] = {}
+        chips_used: List[str] = []
+        try:
+            transfer_rows = self._get_json(f"/entry/{manager_id}/transfers/")
+            for row in sorted(transfer_rows if isinstance(transfer_rows, list) else [], key=lambda x: x.get("time", "")):
+                acquisition_prices.pop(int(row.get("element_out", 0)), None)
+                incoming = int(row.get("element_in", 0))
+                if incoming:
+                    acquisition_prices[incoming] = round(float(row.get("element_in_cost", 0)) / 10.0, 1)
+        except (LiveDataUnavailableError, InvalidTeamIdError, TypeError, ValueError):
+            acquisition_prices = {}
+
+        try:
+            history_payload = self._get_json(f"/entry/{manager_id}/history/")
+            raw_chips = history_payload.get("chips", []) if isinstance(history_payload, dict) else []
+            chips_used = [str(row.get("name", "")) for row in raw_chips if row.get("name")]
+        except (LiveDataUnavailableError, InvalidTeamIdError, TypeError, ValueError):
+            history_payload = {}
+            raw_chips = []
+
+        half_start, half_end = (1, 19) if int(target_event) <= 19 else (20, 38)
+        chip_aliases = {
+            "wildcard": "wildcard",
+            "freehit": "free_hit",
+            "free_hit": "free_hit",
+            "bboost": "bench_boost",
+            "bench_boost": "bench_boost",
+            "3xc": "triple_captain",
+            "triple_captain": "triple_captain",
+        }
+        free_transfers = reconstruct_free_transfers(
+            history_payload.get("current", []) if isinstance(history_payload, dict) else [],
+            raw_chips,
+            int(target_event),
+        )
+
+        used_this_half = {
+            chip_aliases.get(str(row.get("name", "")).lower())
+            for row in raw_chips
+            if half_start <= int(row.get("event", 0) or 0) <= half_end
+        }
+        chips_available = {
+            chip: 0 if chip in used_this_half else 1
+            for chip in ("wildcard", "free_hit", "bench_boost", "triple_captain")
+        }
         squad_players = []
 
         for pick in picks_data.get("picks", []):
@@ -527,11 +670,26 @@ class FplOfficialProvider(DataProvider):
                     f"Player ID {pid} in imported squad does not exist in the active FPL elements universe."
                 )
 
+            raw_purchase = pick.get("purchase_price")
+            if raw_purchase is not None:
+                purchase_price = round(float(raw_purchase) / 10.0, 1) if float(raw_purchase) > 25 else round(float(raw_purchase), 1)
+            else:
+                purchase_price = acquisition_prices.get(
+                    pid,
+                    player_info.season_start_price or player_info.current_price,
+                )
+
+            raw_selling = pick.get("selling_price")
+            if raw_selling is not None:
+                selling_price = round(float(raw_selling) / 10.0, 1) if float(raw_selling) > 25 else round(float(raw_selling), 1)
+            else:
+                selling_price = calculate_selling_price(purchase_price, player_info.current_price)
+
             squad_players.append(SquadPlayer(
                 player_id=pid,
                 position=player_info.position,
-                purchase_price=player_info.current_price,
-                selling_price=player_info.current_price,
+                purchase_price=purchase_price,
+                selling_price=selling_price,
                 starting=pick["position"] <= 11,
                 captain=bool(pick.get("is_captain", False)),
                 vice_captain=bool(pick.get("is_vice_captain", False)),
@@ -549,7 +707,8 @@ class FplOfficialProvider(DataProvider):
             overall_points=overall_points,
             overall_rank=overall_rank,
             squad=squad_players,
-            chips_used=[]
+            chips_used=chips_used,
+            chips_available=chips_available,
         )
 
     def get_status(self) -> DataStatus:

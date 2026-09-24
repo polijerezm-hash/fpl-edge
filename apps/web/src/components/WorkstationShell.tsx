@@ -1,20 +1,47 @@
 import React from "react";
 import { motion } from "framer-motion";
-import { BarChart3, CalendarRange, ChevronDown, CircleDollarSign, Command, HelpCircle, PanelRightClose, PanelRightOpen, RefreshCw, Sparkles, Target, Trophy } from "lucide-react";
+import { BarChart3, CalendarRange, ChevronDown, Command, PanelRightClose, PanelRightOpen, RefreshCw, Target } from "lucide-react";
 import { BrandMark } from "@/components/BrandMark";
 
 type WorkspaceTab = "pitch" | "horizon" | "analytics";
 
 interface WorkstationShellProps {
-  managerState: any; liveStatus: any; managerId: number; currentGw: number;
-  activeTab: WorkspaceTab; setActiveTab: (tab: WorkspaceTab) => void;
-  dockOpen: boolean; setDockOpen: (open: boolean) => void;
-  isRefreshing?: boolean; onRefresh: () => void; onExit: () => void; children: React.ReactNode;
+  managerState: any;
+  liveStatus: any;
+  managerId: number;
+  currentGw: number;
+  activeTab: WorkspaceTab;
+  setActiveTab: (tab: WorkspaceTab) => void;
+  dockOpen: boolean;
+  setDockOpen: (open: boolean) => void;
+  isRefreshing?: boolean;
+  onRefresh: () => void;
+  onExit: () => void;
+  children: React.ReactNode;
+  optimizationResult?: any;
+  playersDict?: Record<number, any>;
+  projectionsDict?: Record<number, any>;
 }
 
 const compact = new Intl.NumberFormat("en-GB", { notation: "compact", maximumFractionDigits: 1 });
 
-export function WorkstationShell({ managerState, liveStatus, managerId, currentGw, activeTab, setActiveTab, dockOpen, setDockOpen, isRefreshing, onRefresh, onExit, children }: WorkstationShellProps) {
+export function WorkstationShell({
+  managerState,
+  liveStatus,
+  managerId,
+  currentGw,
+  activeTab,
+  setActiveTab,
+  dockOpen,
+  setDockOpen,
+  isRefreshing,
+  onRefresh,
+  onExit,
+  children,
+  optimizationResult,
+  playersDict,
+  projectionsDict,
+}: WorkstationShellProps) {
   const score = managerState?.team_score ?? 82;
   const bank = Number(managerState?.bank ?? 0);
   const freeTransfers = managerState?.free_transfers ?? 1;
@@ -50,7 +77,7 @@ export function WorkstationShell({ managerState, liveStatus, managerId, currentG
 
       <div className={`grid min-h-[calc(100vh-6.5rem)] ${dockOpen ? "xl:grid-cols-[minmax(0,7fr)_minmax(290px,3fr)]" : "grid-cols-1"}`}>
         <section className="min-w-0 p-4 lg:p-6">{children}</section>
-        {dockOpen && <AnalyticsPreview liveStatus={liveStatus} managerState={managerState} />}
+        {dockOpen && <AnalyticsPreview liveStatus={liveStatus} managerState={managerState} optimizationResult={optimizationResult} playersDict={playersDict} projectionsDict={projectionsDict} />}
       </div>
     </motion.main>
   );
@@ -60,16 +87,136 @@ function Metric({ label, value, delta, tone, suffix }: { label: string; value: s
   return <div className="flex h-full min-w-max items-center gap-2 px-3"><span className="hidden text-[9px] font-bold uppercase tracking-[.13em] text-slate-400 lg:block">{label}</span><span className={`font-mono text-xs font-semibold tabular-nums ${tone === "indigo" ? "text-indigo-600" : tone === "emerald" ? "text-emerald-600" : "text-slate-800"}`}>{value}<span className="text-[9px] text-slate-400">{suffix}</span></span>{typeof delta === "number" && <span className={`font-mono text-[9px] tabular-nums ${delta >= 0 ? "text-emerald-600" : "text-rose-600"}`}>{delta >= 0 ? "▲" : "▼"}{compact.format(Math.abs(delta))}</span>}</div>;
 }
 
-function AnalyticsPreview({ liveStatus, managerState }: { liveStatus: any; managerState: any }) {
-  return <aside className="border-l border-slate-200 bg-white p-5">
-    <div className="flex items-center justify-between"><div><p className="text-[10px] font-bold uppercase tracking-[.16em] text-slate-400">Analytics dock</p><h2 className="mt-1 text-sm font-semibold text-slate-900">Decision context</h2></div><span className={`h-2 w-2 rounded-full ${liveStatus ? "bg-emerald-500" : "bg-amber-400"}`} /></div>
-    <div className="mt-6 border-y border-slate-200 py-5"><div className="flex items-start gap-3"><div className="border border-indigo-100 bg-indigo-50 p-2 text-indigo-600"><Sparkles className="h-4 w-4" /></div><div><p className="text-xs font-semibold text-slate-900">Planner is calibrating</p><p className="mt-1 text-xs leading-5 text-slate-500">Your tactical recommendation will include minutes risk, five-week value and alternative paths.</p></div></div></div>
-    <div className="grid grid-cols-2 border-b border-slate-200"><DockMetric icon={CircleDollarSign} label="Squad value" value={`£${Number(managerState?.team_value ?? 100).toFixed(1)}m`} /><DockMetric icon={Trophy} label="Overall points" value={String(managerState?.overall_points ?? "—")} /></div>
-    <div className="mt-5"><p className="text-[10px] font-bold uppercase tracking-[.16em] text-slate-400">Next deadline</p><p className="mt-2 font-mono text-sm font-semibold tabular-nums text-slate-800">{liveStatus?.current_deadline ? new Date(liveStatus.current_deadline).toLocaleString("en-GB", { weekday: "short", hour: "2-digit", minute: "2-digit" }) : "Awaiting live data"}</p></div>
-    <button className="mt-6 flex w-full items-center justify-center gap-2 border border-slate-200 px-3 py-2.5 text-xs font-semibold text-slate-600 transition hover:border-indigo-300 hover:text-indigo-600 active:scale-[.98]"><HelpCircle className="h-3.5 w-3.5" /> Explain this plan</button>
-  </aside>;
+function AnalyticsPreview({ liveStatus, managerState, optimizationResult, playersDict, projectionsDict }: {
+  liveStatus: any; managerState: any; optimizationResult: any;
+  playersDict?: Record<number, any>; projectionsDict?: Record<number, any>;
+}) {
+  const topPlan = optimizationResult?.plans?.[0];
+  const gw1 = topPlan?.gameweeks?.[0];
+  const captainId = gw1?.captain;
+  const capPlayer = captainId && playersDict ? playersDict[captainId] : null;
+  const capProj = captainId && projectionsDict ? projectionsDict[captainId] : null;
+  const transferIn = gw1?.transfers_in?.[0];
+  const transferOut = gw1?.transfers_out?.[0];
+  const inPlayer = transferIn && playersDict ? playersDict[transferIn] : null;
+  const outPlayer = transferOut && playersDict ? playersDict[transferOut] : null;
+
+  const bank = Number(managerState?.bank ?? 0);
+  const ft = managerState?.free_transfers ?? 1;
+  const rank = managerState?.overall_rank ?? 0;
+  const points = managerState?.overall_points ?? 0;
+
+  const deadline = liveStatus?.current_deadline ? new Date(liveStatus.current_deadline) : null;
+  const deadlineStr = deadline
+    ? deadline.toLocaleString("en-GB", { weekday: "short", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })
+    : null;
+
+  const compact = new Intl.NumberFormat("en-GB", { notation: "compact", maximumFractionDigits: 1 });
+
+  return (
+    <aside className="border-l border-slate-200 bg-white">
+      {/* Status dot + header */}
+      <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
+        <div>
+          <p className="text-[9px] font-bold uppercase tracking-[.16em] text-slate-400">Decision dock</p>
+          <h2 className="mt-1 text-sm font-semibold text-slate-900">Live context</h2>
+        </div>
+        <div className={`flex items-center gap-1.5`}>
+          <span className={`h-2 w-2 rounded-full ${liveStatus ? "bg-emerald-500" : "bg-amber-400"}`} />
+          <span className="text-[10px] font-medium text-slate-400">{liveStatus ? "Live" : "Connecting"}</span>
+        </div>
+      </div>
+
+      {/* Captain recommendation */}
+      {capPlayer && capProj && (
+        <div className="border-b border-slate-200 p-4">
+          <p className="text-[9px] font-bold uppercase tracking-[.15em] text-slate-400">Captain pick</p>
+          <div className="mt-3 flex items-center justify-between">
+            <div>
+              <p className="text-sm font-semibold text-slate-900">{capPlayer.web_name}</p>
+              <p className="mt-0.5 text-[10px] text-slate-500">{capPlayer.position} · {teamsLabel(capPlayer)}</p>
+            </div>
+            <div className="text-right">
+              <p className="font-mono text-base font-semibold tabular-nums text-amber-600">{(capProj.mean_xp * 2).toFixed(1)}</p>
+              <p className="text-[9px] text-slate-400">cap xP</p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Top transfer */}
+      {inPlayer && outPlayer && (
+        <div className="border-b border-slate-200 p-4">
+          <p className="text-[9px] font-bold uppercase tracking-[.15em] text-slate-400">Top transfer</p>
+          <div className="mt-3 space-y-1.5">
+            <div className="flex items-center gap-2 rounded border border-rose-200 bg-rose-50 px-3 py-1.5">
+              <span className="text-[9px] font-bold text-rose-500">OUT</span>
+              <span className="text-xs font-semibold text-rose-700">{outPlayer.web_name}</span>
+            </div>
+            <div className="flex items-center gap-2 rounded border border-emerald-200 bg-emerald-50 px-3 py-1.5">
+              <span className="text-[9px] font-bold text-emerald-600">IN</span>
+              <span className="text-xs font-semibold text-emerald-700">{inPlayer.web_name}</span>
+            </div>
+          </div>
+          {topPlan?.gain_vs_hold !== undefined && (
+            <p className="mt-2 font-mono text-[10px] tabular-nums text-slate-500">
+              +{Number(topPlan.gain_vs_hold).toFixed(1)} xP vs hold
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* Key squad metrics */}
+      <div className="grid grid-cols-2 divide-x divide-y divide-slate-200 border-b border-slate-200">
+        <DockMetric label="Bank" value={`£${bank.toFixed(1)}m`} />
+        <DockMetric label="Free transfers" value={`${Math.min(5, ft)}/5`} />
+        <DockMetric label="Overall pts" value={points ? String(points) : "—"} />
+        <DockMetric label="Overall rank" value={rank ? compact.format(rank) : "—"} />
+      </div>
+
+      {/* Deadline */}
+      {deadlineStr && (
+        <div className="border-b border-slate-200 p-4">
+          <p className="text-[9px] font-bold uppercase tracking-[.15em] text-slate-400">Next deadline</p>
+          <p className="mt-2 font-mono text-sm font-semibold tabular-nums text-slate-900">{deadlineStr}</p>
+        </div>
+      )}
+
+      {/* Optimization xP */}
+      {topPlan && (
+        <div className="p-4">
+          <p className="text-[9px] font-bold uppercase tracking-[.15em] text-slate-400">Projected GW score</p>
+          <div className="mt-2 flex items-baseline gap-1">
+            <span className="font-mono text-2xl font-semibold tabular-nums text-indigo-600">
+              {Number(topPlan.expected_points).toFixed(1)}
+            </span>
+            <span className="text-[10px] font-medium text-slate-400">xP</span>
+          </div>
+          <p className="mt-1 font-mono text-[10px] tabular-nums text-emerald-600">
+            +{Number(topPlan.gain_vs_hold).toFixed(1)} above baseline
+          </p>
+          <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-slate-100">
+            <div
+              className="h-full rounded-full bg-indigo-500"
+              style={{ width: `${Math.min(100, (Number(topPlan.expected_points) / Math.max(1, Number(topPlan.expected_points) * 1.25)) * 100)}%` }}
+            />
+          </div>
+        </div>
+      )}
+    </aside>
+  );
 }
 
-function DockMetric({ icon: Icon, label, value }: { icon: React.ElementType; label: string; value: string }) {
-  return <div className="py-4 first:border-r first:border-slate-200 first:pr-4 last:pl-4"><Icon className="h-3.5 w-3.5 text-slate-400" /><p className="mt-3 text-[9px] font-bold uppercase tracking-[.13em] text-slate-400">{label}</p><p className="mt-1 font-mono text-sm font-semibold tabular-nums text-slate-800">{value}</p></div>;
+function teamsLabel(player: any) {
+  return player?.team_id ? `Team ${player.team_id}` : "Unknown";
 }
+
+function DockMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="p-4">
+      <p className="text-[9px] font-bold uppercase tracking-[.13em] text-slate-400">{label}</p>
+      <p className="mt-1.5 font-mono text-sm font-semibold tabular-nums text-slate-800">{value}</p>
+    </div>
+  );
+}
+

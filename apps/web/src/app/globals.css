@@ -3,14 +3,24 @@
 @tailwind utilities;
 
 @layer base {
+  :root {
+    color-scheme: light;
+  }
+
+  * {
+    border-color: #e2e8f0;
+  }
+
+  html {
+    background: #f8fafc;
+  }
+
   body {
-    @apply bg-background text-slate-100 font-sans antialiased selection:bg-primary selection:text-black;
-    background-image: linear-gradient(rgba(168, 215, 65, 0.018) 1px, transparent 1px);
-    background-size: 100% 32px;
+    @apply bg-background text-slate-950 font-sans antialiased selection:bg-indigo-100 selection:text-indigo-950;
   }
 
   button, input, select {
-    @apply focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/70 focus-visible:ring-offset-2 focus-visible:ring-offset-background;
+    @apply focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500 focus-visible:ring-offset-2 focus-visible:ring-offset-white;
   }
 }
 
@@ -20,14 +30,14 @@
   height: 6px;
 }
 ::-webkit-scrollbar-track {
-  background: #0d120f;
+  background: #f8fafc;
 }
 ::-webkit-scrollbar-thumb {
-  background: #2c3931;
+  background: #cbd5e1;
   border-radius: 4px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #a8d741;
+  background: #6366f1;
 }
 
 @layer components {
@@ -36,6 +46,6 @@
   }
 
   .panel {
-    @apply border border-surfaceBorder bg-surface shadow-[0_16px_45px_rgba(0,0,0,0.14)];
+    @apply border border-surfaceBorder bg-surface shadow-[0_16px_45px_rgba(15,23,42,0.08)];
   }
 }

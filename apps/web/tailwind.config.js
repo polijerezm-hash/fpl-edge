@@ -7,22 +7,22 @@ export default {
   theme: {
     extend: {
       colors: {
-        background: "#0d120f",
-        surface: "#151c18",
-        surfaceHover: "#1d2721",
-        surfaceBorder: "#2c3931",
+        background: "#f8fafc",
+        surface: "#ffffff",
+        surfaceHover: "#f1f5f9",
+        surfaceBorder: "#e2e8f0",
         primary: {
-          DEFAULT: "#a8d741",
-          hover: "#b9e45b",
-          light: "#d4ef97",
+          DEFAULT: "#4f46e5",
+          hover: "#4338ca",
+          light: "#e0e7ff",
         },
         secondary: {
           DEFAULT: "#e5b85c",
           violet: "#b99bd8",
         },
         pitch: {
-          grass: "#173e28",
-          line: "#a8d741",
+          grass: "#e9f7ef",
+          line: "#047857",
         }
       },
       borderRadius: {

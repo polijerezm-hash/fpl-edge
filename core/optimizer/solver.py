@@ -239,9 +239,11 @@ class OptimizationEngine:
             prob += pulp.lpSum([start[(p, g)] for p in pids_by_pos[Position.FWD]]) >= 1
             prob += pulp.lpSum([start[(p, g)] for p in pids_by_pos[Position.FWD]]) <= 3
 
-            # 6. Exactly 1 Captain & 1 Vice Captain
+            # 6. Exactly 1 Captain & 1 Vice Captain (Captains restricted to outfield players)
             prob += pulp.lpSum([cap[(p, g)] for p in pids]) == 1
             prob += pulp.lpSum([vcap[(p, g)] for p in pids]) == 1
+            for gkp_pid in pids_by_pos[Position.GKP]:
+                prob += cap[(gkp_pid, g)] == 0
 
             # 7. Transfers & Squad Transition
             prev_squad_vars = [1 if p in initial_squad else 0 for p in pids] if g_idx == 0 else [squad[(p, target_gws[g_idx-1])] for p in pids]

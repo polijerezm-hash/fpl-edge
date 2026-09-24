@@ -27,6 +27,7 @@ class StrategyEngine:
                     "player_id": pid,
                     "web_name": player.web_name,
                     "team_id": player.team_id,
+                    "position": player.position.value,
                     "mean_xp": proj.mean_xp,
                     "p10_xp": proj.p10_xp,
                     "p90_xp": proj.p90_xp,
@@ -40,19 +41,23 @@ class StrategyEngine:
         if not candidates:
             return {"shield": None, "diamond": None, "sword": None, "ranked": []}
 
-        # 1. Diamond: Highest mean xP
-        diamond = candidates[0]
+        # Prefer outfield candidates for captaincy recommendations
+        outfield_candidates = [c for c in candidates if c["position"] != "GKP"]
+        pool = outfield_candidates if outfield_candidates else candidates
 
-        # 2. Shield: Highest ownership / start probability among top 3 xP candidates
-        top_candidates = candidates[:min(4, len(candidates))]
+        # 1. Diamond: Highest mean xP among outfielders
+        diamond = pool[0]
+
+        # 2. Shield: Highest ownership / start probability among top xP outfield candidates
+        top_candidates = pool[:min(4, len(pool))]
         shield = max(top_candidates, key=lambda c: c["selected_by_pct"] * 0.5 + c["start_prob"] * 50.0)
 
-        # 3. Sword: Highest P90 ceiling among differential candidates (< 30% selected)
-        differentials = [c for c in candidates if c["selected_by_pct"] < 30.0]
+        # 3. Sword: Highest P90 ceiling among differential outfield candidates (< 30% selected)
+        differentials = [c for c in pool if c["selected_by_pct"] < 30.0]
         if differentials:
             sword = max(differentials, key=lambda c: c["p90_xp"])
         else:
-            sword = max(candidates, key=lambda c: c["p90_xp"])
+            sword = max(pool, key=lambda c: c["p90_xp"])
 
         return {
             "shield": shield,

@@ -160,6 +160,18 @@ class FplOfficialProvider(DataProvider):
             except (ValueError, TypeError):
                 sel_pct = 0.0
 
+            def safe_float(val, default=0.0):
+                try:
+                    return float(val) if val is not None else default
+                except (ValueError, TypeError):
+                    return default
+
+            def safe_int(val, default=0):
+                try:
+                    return int(val) if val is not None else default
+                except (ValueError, TypeError):
+                    return default
+
             players.append(Player(
                 player_id=el["id"],
                 first_name=el.get("first_name", ""),
@@ -167,11 +179,26 @@ class FplOfficialProvider(DataProvider):
                 web_name=el.get("web_name", "Unknown"),
                 team_id=el["team"],
                 position=pos_map.get(el.get("element_type", 3), Position.MID),
-                current_price=round(float(el.get("now_cost", 50)) / 10.0, 1),
+                current_price=round(safe_float(el.get("now_cost", 50)) / 10.0, 1),
                 selected_by_pct=sel_pct,
                 status=el.get("status", "a"),
                 chance_of_playing_next_round=el.get("chance_of_playing_next_round"),
-                news=el.get("news", "") or ""
+                news=el.get("news", "") or "",
+                minutes=safe_int(el.get("minutes")),
+                starts=safe_int(el.get("starts")),
+                form=safe_float(el.get("form")),
+                ep_next=safe_float(el.get("ep_next")),
+                points_per_game=safe_float(el.get("points_per_game")),
+                total_points=safe_int(el.get("total_points")),
+                goals_scored=safe_int(el.get("goals_scored")),
+                assists=safe_int(el.get("assists")),
+                clean_sheets=safe_int(el.get("clean_sheets")),
+                saves=safe_int(el.get("saves")),
+                bonus=safe_int(el.get("bonus")),
+                expected_goals=safe_float(el.get("expected_goals")),
+                expected_assists=safe_float(el.get("expected_assists")),
+                expected_goal_involvements=safe_float(el.get("expected_goal_involvements")),
+                expected_goals_conceded=safe_float(el.get("expected_goals_conceded"))
             ))
         return players
 

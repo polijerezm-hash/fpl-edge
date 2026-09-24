@@ -47,10 +47,33 @@ class ProjectionEngine:
             start_prob = reconciled_mins.get("start_probability", 0.8)
         else:
             avail = self.availability_engine.estimate_player_availability(player, player_team, is_home)
-            xmins = avail.chance_start * 85.0
+            xmins = avail.expected_minutes
             start_prob = avail.chance_start
 
         mins_fraction = min(1.0, max(0.0, xmins / 90.0))
+
+        # If zero expected minutes, return zero projection immediately
+        if mins_fraction <= 0.01 or start_prob <= 0.01:
+            return Projection(
+                player_id=player.player_id,
+                gameweek=fixture.gameweek,
+                model_version=model_version,
+                as_of_timestamp=as_of_timestamp,
+                snapshot_id=snapshot_id,
+                xmins=0.0,
+                start_probability=0.0,
+                mean_xp=0.0,
+                p10_xp=0.0,
+                p50_xp=0.0,
+                p90_xp=0.0,
+                goal_xp=0.0,
+                assist_xp=0.0,
+                clean_sheet_xp=0.0,
+                save_xp=0.0,
+                bonus_xp=0.0,
+                fixtures_count=1,
+                fixture_ids=[fixture.fixture_id]
+            )
 
         # 2. Match Context Dynamics
         att_str = player_team.strength_attack_home if is_home else player_team.strength_attack_away
@@ -62,18 +85,31 @@ class ProjectionEngine:
         expected_team_goals = max(0.4, 1.35 * att_str / max(0.6, opp_def_str))
         expected_team_conceded = max(0.3, 1.25 * opp_att_str / max(0.6, def_str))
 
-        # 3. Component Rates per 90 mins
+        # 3. Component Rates per 90 mins (incorporating real player stats where available)
         price_delta = max(0.0, player.current_price - 4.5)
         
+        # Calculate empirical xG per 90 / xA per 90 if player has played significant minutes
+        has_stats = player.minutes >= 180
+        empirical_xg_90 = (player.expected_goals / (player.minutes / 90.0)) if has_stats and player.expected_goals > 0 else None
+        empirical_xa_90 = (player.expected_assists / (player.minutes / 90.0)) if has_stats and player.expected_assists > 0 else None
+
         if player.position == Position.FWD:
-            goal_rate_90 = (0.35 + 0.04 * price_delta) * (expected_team_goals / 1.35)
-            assist_rate_90 = 0.14 + 0.02 * price_delta
+            baseline_goal_rate = (0.35 + 0.04 * price_delta) * (expected_team_goals / 1.35)
+            goal_rate_90 = (0.5 * empirical_xg_90 + 0.5 * baseline_goal_rate) if empirical_xg_90 is not None else baseline_goal_rate
+            
+            baseline_assist_rate = 0.14 + 0.02 * price_delta
+            assist_rate_90 = (0.5 * empirical_xa_90 + 0.5 * baseline_assist_rate) if empirical_xa_90 is not None else baseline_assist_rate
+            
             clean_sheet_prob = 0.0
             saves_90 = 0.0
             bonus_factor = 0.60
         elif player.position == Position.MID:
-            goal_rate_90 = (0.22 + 0.035 * price_delta) * (expected_team_goals / 1.35)
-            assist_rate_90 = 0.18 + 0.025 * price_delta
+            baseline_goal_rate = (0.22 + 0.035 * price_delta) * (expected_team_goals / 1.35)
+            goal_rate_90 = (0.5 * empirical_xg_90 + 0.5 * baseline_goal_rate) if empirical_xg_90 is not None else baseline_goal_rate
+            
+            baseline_assist_rate = 0.18 + 0.025 * price_delta
+            assist_rate_90 = (0.5 * empirical_xa_90 + 0.5 * baseline_assist_rate) if empirical_xa_90 is not None else baseline_assist_rate
+            
             clean_sheet_prob = math.exp(-expected_team_conceded) * 0.85
             saves_90 = 0.0
             bonus_factor = 0.55
@@ -118,8 +154,18 @@ class ProjectionEngine:
         card_deduction = 0.12 * mins_fraction
         bonus_xp = (expected_goals * 1.8 + expected_assists * 1.2 + (1.0 if clean_sheet_prob > 0.4 else 0.0) * 0.8) * bonus_factor
 
-        mean_xp = appearance_xp + goal_xp + assist_xp + cs_xp + save_xp + bonus_xp - conceded_xp_deduction - card_deduction
-        mean_xp = round(max(0.0, mean_xp), 2)
+        model_mean_xp = appearance_xp + goal_xp + assist_xp + cs_xp + save_xp + bonus_xp - conceded_xp_deduction - card_deduction
+        model_mean_xp = round(max(0.0, model_mean_xp), 2)
+
+        # Blend with official FPL ep_next / form signal if available
+        if player.ep_next > 0:
+            ep_next_mins = player.ep_next * mins_fraction
+            mean_xp = round(0.50 * model_mean_xp + 0.50 * ep_next_mins, 2)
+        elif player.form > 0:
+            form_mult = min(1.25, max(0.75, player.form / 4.5))
+            mean_xp = round(model_mean_xp * form_mult, 2)
+        else:
+            mean_xp = model_mean_xp
 
         # Monte Carlo Distribution Percentiles (P10, P50, P90)
         std_dev = max(1.2, mean_xp * 0.45 + 0.8)
@@ -154,6 +200,7 @@ class ProjectionEngine:
         player_team: Team,
         fixtures_info: List[Tuple[Team, Fixture, bool]],
         gameweek: int,
+        reconciled_mins: Optional[Dict[str, float]] = None,
         as_of_timestamp: str = "",
         snapshot_id: Optional[str] = None,
         model_version: str = "1.0.0"
@@ -189,6 +236,7 @@ class ProjectionEngine:
                 opponent_team=opp_team,
                 fixture=fixture,
                 is_home=is_home,
+                reconciled_mins=reconciled_mins,
                 as_of_timestamp=as_of_timestamp,
                 snapshot_id=snapshot_id,
                 model_version=model_version
@@ -206,6 +254,7 @@ class ProjectionEngine:
                 opponent_team=opp_team,
                 fixture=fixture,
                 is_home=is_home,
+                reconciled_mins=reconciled_mins,
                 as_of_timestamp=as_of_timestamp,
                 snapshot_id=snapshot_id,
                 model_version=model_version

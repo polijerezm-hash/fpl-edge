@@ -21,6 +21,21 @@ class Player(BaseModel):
     status: str = "a"  # 'a'=available, 'd'=doubtful, 'i'=injured, 's'=suspended, 'u'=unavailable
     chance_of_playing_next_round: Optional[int] = 100
     news: Optional[str] = ""
+    minutes: int = 0
+    starts: int = 0
+    form: float = 0.0
+    ep_next: float = 0.0
+    points_per_game: float = 0.0
+    total_points: int = 0
+    goals_scored: int = 0
+    assists: int = 0
+    clean_sheets: int = 0
+    saves: int = 0
+    bonus: int = 0
+    expected_goals: float = 0.0
+    expected_assists: float = 0.0
+    expected_goal_involvements: float = 0.0
+    expected_goals_conceded: float = 0.0
 
 class Team(BaseModel):
     team_id: int

@@ -14,6 +14,7 @@ from core.data.errors import (
     InvalidTeamIdError, CurrentSquadInvalidError, StaleSnapshotError,
     OptimisationFailedError, RecommendationValidationFailedError
 )
+from core.availability.engine import AvailabilityEngine
 from core.projections.engine import ProjectionEngine
 from core.optimizer.solver import OptimizationEngine
 from core.strategy.engine import StrategyEngine
@@ -45,6 +46,7 @@ def get_repo(data_mode: str = "live") -> DataRepository:
     return _repositories[mode]
 
 # Engines
+availability_engine = AvailabilityEngine()
 projection_engine = ProjectionEngine()
 optimizer_engine = OptimizationEngine()
 strategy_engine = StrategyEngine()
@@ -110,6 +112,17 @@ def _get_all_projections_for_gw(gw: int, data_mode: str = "live") -> Dict[int, P
             team_fixtures_map.setdefault(f.home_team_id, []).append((teams_dict[f.away_team_id], f, True))
             team_fixtures_map.setdefault(f.away_team_id, []).append((teams_dict[f.home_team_id], f, False))
 
+    # Pre-calculate team level availability reconciliation
+    players_by_team: Dict[int, List[Player]] = {}
+    for p in players:
+        players_by_team.setdefault(p.team_id, []).append(p)
+
+    reconciled_mins_by_team: Dict[int, Dict[int, Dict[str, float]]] = {}
+    for tid, t_players in players_by_team.items():
+        p_team = teams_dict.get(tid)
+        if p_team:
+            reconciled_mins_by_team[tid] = availability_engine.reconcile_team_availability(t_players, p_team, is_home=True)
+
     as_of = repo.get_as_of_timestamp()
     snap_id = repo.get_snapshot_id()
     projections = {}
@@ -119,11 +132,14 @@ def _get_all_projections_for_gw(gw: int, data_mode: str = "live") -> Dict[int, P
         if not p_team:
             continue
         p_fixtures = team_fixtures_map.get(p.team_id, [])
+        p_rec_mins = reconciled_mins_by_team.get(p.team_id, {}).get(p.player_id)
+        
         proj = projection_engine.calculate_gameweek_projection(
             player=p,
             player_team=p_team,
             fixtures_info=p_fixtures,
             gameweek=gw,
+            reconciled_mins=p_rec_mins,
             as_of_timestamp=as_of,
             snapshot_id=snap_id
         )
